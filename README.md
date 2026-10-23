@@ -20,10 +20,10 @@ setup.cmd -WithOCR        :: 顺便装 RapidOCR（识别质量明显更好，约
 setup.cmd -InstallPlugin  :: 顺便注册进 DSH profile
 ```
 
-### ② npm（等发布后可用）
+### ② npm（已发布）
 
 ```bash
-npm i dsh-pc-hands
+npm i dsh-pc-hands          # https://www.npmjs.com/package/dsh-pc-hands
 ```
 
 包内自带 `pc/` 脚本；插件会优先用包里的那份，没有才回落到 `~/OllamaStart/pc`。

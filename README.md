@@ -66,13 +66,14 @@ pc-doctor
 
 **找路径的规则**（不用配也能跑）：脚本目录 `config.pcDir` → `DSH_PC_DIR` → `~/OllamaStart/pc` → `~/dsh-pc-hands/pc` → `~/.dsh/pc-hands`；Python `config.pythonPath` → `DSH_PC_PYTHON` → DSH 自带运行时 → 常见安装位置 → `PATH`。都找不到时不会静默失败，而是注册一个会解释原因的 `pc_doctor`。
 
-## 18 个工具
+## 19 个工具
 
 | 分类 | 工具 | 说明 |
 |---|---|---|
 | 看 | `pc_windows` | 列出可见窗口（句柄/进程/位置/标题） |
 | | `pc_see` | 截屏 + OCR，返回文本与截图路径 |
 | | `pc_find` | 按文字找坐标（支持 `region` / `below` / `above` / `pick`） |
+| 等 | `pc_wait` | 等某段文字出现（OCR 轮询），替代 sleep |
 | 动 | `pc_click` | 点文字、点坐标、点控件 |
 | | `pc_type` | 输入文本（中文走剪贴板，任何程序都吃得下） |
 | | `pc_key` | 按键 / 组合键 |
@@ -90,6 +91,15 @@ pc-doctor
 | 自检 | `pc_doctor` | 一屏报告环境是否就绪 |
 
 动键鼠的工具会自动弹提示：「本鲸开始动键鼠了」→「做完了，可以碰屏幕了」（15 秒去抖）。
+
+### v0.7.0 新增（都是实战踩出来的）
+
+- `pc_scroll` 支持 `pixels`（精细，40 左右很顺）和 `untilText`（一直滚到看见某段字）
+- `pc_wait`：等文字出现，替代 `sleep` —— 页面慢的时候不再靠猜秒数
+- `pc_click` 支持 `labelText`：勾选框/单选按钮按坐标点不动时点它旁边的文字
+- `pc_type` 支持 `secret`：密码/令牌粘完立刻清空剪贴板
+- `pc_doctor` 在缩放不等于 100% 时直接给 WARN（那种机器上点偏最常见）
+- 文字匹配统一**不区分大小写**（`Generate new token` == `Generate New Token`）
 
 ## 出问题了怎么办
 
@@ -125,7 +135,7 @@ MIT
 
 # dsh-pc-hands (English)
 
-A DeepSeek Harness plugin that gives an agent hands and eyes on Windows: screenshot + OCR, click by text, type, scroll, clipboard, window management, popups guard, and a verified multi-step task runner — 18 tools total.
+A DeepSeek Harness plugin that gives an agent hands and eyes on Windows: screenshot + OCR, click by text, type, scroll, clipboard, window management, popups guard, and a verified multi-step task runner — 19 tools total.
 
 ```bat
 setup.cmd -WithOCR -InstallPlugin     :: install scripts, RapidOCR, and register the plugin

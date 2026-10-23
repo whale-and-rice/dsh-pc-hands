@@ -1246,7 +1246,34 @@ def main(argv):
                 nums.append(int(float(a))); i += 1
         drag(*nums[:4], steps=steps, hold_ms=hold, gap_ms=gap)
     elif cmd == "scroll":
-        scroll(pos[0])
+        if "--px" in args:
+            scroll_px(int(args[args.index("--px") + 1]))
+        else:
+            scroll(pos[0])
+    elif cmd == "scrollto":
+        # scrollto <文字> [--timeout 秒] [--region x0,y0,x1,y1] [--step 像素]
+        rg, to, st = None, 25.0, -90
+        for i, a in enumerate(args):
+            if a == "--region":
+                rg = tuple(int(v) for v in args[i + 1].split(","))
+            elif a == "--timeout":
+                to = float(args[i + 1])
+            elif a == "--step":
+                st = int(args[i + 1])
+        scroll_to(pos[0], timeout=to, region=rg, step=st)
+    elif cmd == "waittext":
+        rg, to = None, 20.0
+        for i, a in enumerate(args):
+            if a == "--region":
+                rg = tuple(int(v) for v in args[i + 1].split(","))
+            elif a == "--timeout":
+                to = float(args[i + 1])
+        wait_text(pos[0], timeout=to, region=rg)
+    elif cmd == "clicklabel":
+        rg = None
+        if "--region" in args:
+            rg = tuple(int(v) for v in args[args.index("--region") + 1].split(","))
+        click_label(pos[0], region=rg)
     elif cmd == "clipget":
         clip_get()
     elif cmd == "clipset":
@@ -1254,7 +1281,10 @@ def main(argv):
     elif cmd == "doctor":
         doctor()
     elif cmd == "type":
-        type_text(args[0] if args and not args[0].startswith("--") else "")
+        if "--secret" in flags:
+            type_secret(pos[0] if pos else "")
+        else:
+            type_text(args[0] if args and not args[0].startswith("--") else "")
     elif cmd == "key":
         key(pos[0])
     elif cmd == "hotkey":
@@ -1426,7 +1456,11 @@ def doctor():
     except Exception:
         dpi = 0
     scale = ("%d%%" % round(dpi / 96 * 100)) if dpi else "?"
-    ok("DPI", "mode=%s  system_dpi=%d  scale=%s" % (DPI_MODE, dpi, scale))
+    if dpi and abs(dpi - 96) > 1:
+        warn("DPI", "mode=%s  system_dpi=%d  scale=%s  <- 不是 100%%，截图坐标与点击坐标"
+                    "容易差一点点；v0.6.0 起已做 DPI 感知，若仍点偏请回报" % (DPI_MODE, dpi, scale))
+    else:
+        ok("DPI", "mode=%s  system_dpi=%d  scale=%s" % (DPI_MODE, dpi, scale))
     try:
         w, h = int(user32.GetSystemMetrics(0)), int(user32.GetSystemMetrics(1))
         vx, vy = int(user32.GetSystemMetrics(76)), int(user32.GetSystemMetrics(77))
@@ -1496,6 +1530,107 @@ def doctor():
     warns = sum(1 for r in rows if r[0] == "WARN")
     print("  ----  %d FAIL  %d WARN  ----" % (fails, warns))
     return fails
+
+
+# ---------------- v0.7.0：今天踩出来的五个坑 ----------------
+def _norm(s):
+    """去掉所有空白 + 转小写再比。
+
+    OCR 会把中文拆成单字（'质 数' 要能匹配 '质数'），而英文按钮的大小写也常和
+    调用方写的不一致（'Generate new token' vs 'Generate New Token'）。
+    """
+    return "".join(str(s).split()).lower()
+
+
+def screen_text(region=None):
+    """截全屏 → OCR。不打印（轮询里用，打印会把日志刷爆）。"""
+    from PIL import ImageGrab
+    tmp = os.path.join(tempfile.gettempdir(), "_pc_wait.png")
+    ImageGrab.grab(all_screens=True).save(tmp)
+    data = ocr_best(tmp, region) or {}
+    return data.get("lines") or [], data.get("words") or []
+
+
+def wait_text(text, timeout=20.0, region=None, interval=0.7):
+    """等到屏幕（或某块区域）出现这段文字为止。
+
+    以前只能 sleep 固定秒数：页面慢就等不够、快就白等。这是本轮最常缺的东西。
+    """
+    needle = _norm(text)
+    t0 = time.time()
+    while True:
+        try:
+            lines, _words = screen_text(region)
+        except Exception:
+            lines = []
+        if needle and needle in _norm("".join(lines)):
+            print(f"  found '{text}' after {time.time() - t0:.1f}s")
+            return True
+        if time.time() - t0 >= timeout:
+            print(f"  timeout after {timeout}s: '{text}' not seen")
+            return False
+        time.sleep(interval)
+
+
+def scroll_px(px):
+    """精细滚动：一个 wheel 事件，delta 任意。120 = 传统一格。
+
+    Chrome/Edge 支持 sub-notch（40 左右很顺），老程序会忽略小数，那就退化成整格。
+    """
+    _mouse(MOUSEEVENTF["wheel"], data=int(px))
+    print(f"  scrolled {int(px)} (fine)")
+
+
+def scroll_to(text, timeout=25.0, region=None, step=-90, pause=0.35):
+    """往下滚，直到看见这段文字为止（相当于人按住滚轮找东西）。"""
+    needle = _norm(text)
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        try:
+            lines, _words = screen_text(region)
+        except Exception:
+            lines = []
+        if needle and needle in _norm("".join(lines)):
+            print(f"  reached '{text}' in {time.time() - t0:.1f}s")
+            return True
+        scroll_px(step)
+        time.sleep(pause)
+    print(f"  timeout after {timeout}s: '{text}' never showed up")
+    return False
+
+
+def type_secret(text):
+    """输入敏感内容（密码/令牌），粘完立刻把剪贴板清空。"""
+    type_text(text)
+    time.sleep(0.15)
+    _set_clipboard("")
+    print("  secret typed, clipboard cleared")
+
+
+def click_label(text, region=None, timeout=4.0):
+    """按文字点：先找这段字，点它的中心。
+
+    自定义样式的 checkbox/radio 用坐标点不动（真实的 input 被藏起来了），
+    但点它旁边的文字（label）一定能切换 —— 这招今天救了好几次。
+    """
+    needle = _norm(text)
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        try:
+            _lines, words = screen_text(region)
+        except Exception:
+            words = []
+        for w in words:
+            if needle in _norm(w.get("t", "")):
+                x = int(w["x"] + w.get("w", 0) / 2)
+                y = int(w["y"] + w.get("h", 0) / 2)
+                click(x, y)
+                print(f"  clicked label '{text}' at ({x},{y})")
+                return True
+        time.sleep(0.4)
+    print(f"  label not found: '{text}'")
+    return False
+
 
 
 if __name__ == "__main__":

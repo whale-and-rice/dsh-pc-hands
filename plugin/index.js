@@ -35,7 +35,6 @@ const HOMEDIR = homedir()
 // 脚本目录：config → 环境变量 → 本机常见位置 → 家目录下的 dsh-pc-hands
 const DIR_CANDIDATES = [
   process.env.DSH_PC_DIR,
-  join(__dirname, 'pc'),               // 随插件一起 npm 安装时，脚本就在包内
   join(HOMEDIR, 'OllamaStart', 'pc'),
   join(HOMEDIR, 'dsh-pc-hands', 'pc'),
   join(HOMEDIR, '.dsh', 'pc-hands'),
@@ -309,6 +308,7 @@ function applyInner(ctx, config) {
       + '动手前建议先 pc_see 确认界面，点完再 pc_see 核对。',
     parameters: {
       text: { type: 'string', description: '按文字点（OCR）' },
+      labelText: { type: 'string', description: '按文字标签点：勾选框/单选按坐标点不动时，点它旁边的文字（实测最有效）' },
       below: { type: 'string', description: '只点这个短语下方的（可选）' },
       above: { type: 'string', description: '只点这个短语上方的（可选）' },
       region: { type: 'string', description: '像素区域 x0,y0,x1,y1（可选）' },
@@ -321,6 +321,12 @@ function applyInner(ctx, config) {
     },
     output: { schema: { type: 'json' }, render: (_a, v) => [{ type: 'text', text: v.message }] },
     execute(args) {
+      if (args.labelText) {
+        const a = ['clicklabel', String(args.labelText)]
+        if (args.region) a.push('--region', String(args.region))
+        const res = py('pc.py', a, 90000)
+        return { ok: /clicked label/i.test(res.out), message: tail(res.out, 5, 400) }
+      }
       if (args.text) {
         const res = py('pc.py', ['clicktext', String(args.text), ...narrowArgs(args)])
         return { ok: res.code === 0, message: tail(res.out, 8, 700) }
@@ -343,11 +349,16 @@ function applyInner(ctx, config) {
     name: 'pc_type',
     description: '往当前焦点里打字（中文走 Win32 剪贴板，所以任何程序都吃得下）。'
       + '要求：先把目标窗口激活并有输入焦点，否则字会跑到别处。',
-    parameters: { text: { type: 'string', description: '要输入的文字' } },
+    parameters: {
+      text: { type: 'string', description: '要输入的文字' },
+      secret: { type: 'boolean', description: '敏感内容（密码/令牌）：粘完立刻清空剪贴板' },
+    },
     output: { schema: { type: 'json' }, render: (_a, v) => [{ type: 'text', text: v.message }] },
     execute(args) {
       if (!args.text) return { ok: false, message: '需要 text' }
-      const res = py('pc.py', ['type', String(args.text)])
+      const a = ['type', String(args.text)]
+      if (args.secret) a.push('--secret')
+      const res = py('pc.py', a)
       return { ok: res.code === 0, message: tail(res.out, 4, 400) }
     },
   }))
@@ -365,23 +376,60 @@ function applyInner(ctx, config) {
     },
   }))
 
+  // ---- 等 ----
+  reg(defineTool({
+    name: 'pc_wait',
+    description:
+      '等到屏幕上出现这段文字为止（OCR 轮询），返回 ok。用来替代 sleep：'
+      + '页面加载、弹窗出现、按钮变灰这些时刻用它会又快又稳。',
+    parameters: {
+      text: { type: 'string', description: '要等的文字' },
+      timeout: { type: 'number', description: '超时秒数（默认 20）' },
+      region: { type: 'string', description: '只在某区域找：x0,y0,x1,y1（可选）' },
+    },
+    output: { schema: { type: 'json' }, render: (_a, v) => [{ type: 'text', text: v.text }] },
+    execute(args) {
+      const a = ['waittext', String(args.text), '--timeout', String(Number.isFinite(args.timeout) ? args.timeout : 20)]
+      if (args.region) a.push('--region', String(args.region))
+      const r = py('pc.py', a, 180000)
+      const ok = /found '/i.test(r.out)
+      return { ok, text: tail(r.out, 3, 300) }
+    },
+  }))
+
   // ---- 滚 ----
   reg(defineTool({
     name: 'pc_scroll',
     description:
-      '滚动鼠标滚轮（在指针位置滚）。amount 正数向上、负数向下；一格约 120，'
-      + '一次 -1200 大约翻 10 行。可先给 x/y 把指针移过去再滚。',
+      '滚动。三种用法：① pixels（精细，40 左右很顺，Chrome/Edge 支持 sub-notch）；'
+      + '② amount（整格，一格 120）；③ untilText（一直往下滚，直到屏幕上出现这段文字为止）。'
+      + '可先给 x/y 把指针移过去。',
     parameters: {
-      amount: { type: 'number', description: '滚动量，正上负下（建议 ±1200 一档）' },
+      pixels: { type: 'number', description: '精细滚动量（正上负下，例如 -40）' },
+      amount: { type: 'number', description: '整格滚动量（正上负下，例如 -1200）' },
+      untilText: { type: 'string', description: '滚到这段文字出现为止（可选）' },
+      timeout: { type: 'number', description: 'untilText 的超时秒数（默认 25）' },
+      region: { type: 'string', description: 'untilText 只在某区域找：x0,y0,x1,y1' },
       x: { type: 'number', description: '先移动指针到的 x（可选）' },
       y: { type: 'number', description: '先移动指针到的 y（可选）' },
     },
     output: { schema: { type: 'json' }, render: (_a, v) => [{ type: 'text', text: v.ok ? ('滚动 ' + v.amount) : (v.error || '滚动失败') }] },
     execute(args) {
-      const amount = Number.isFinite(args.amount) ? Math.trunc(args.amount) : -1200
       if (Number.isFinite(args.x) && Number.isFinite(args.y)) {
         py('pc.py', ['move', String(Math.trunc(args.x)), String(Math.trunc(args.y))])
       }
+      if (args.untilText) {
+        const a = ['scrollto', String(args.untilText),
+          '--timeout', String(Number.isFinite(args.timeout) ? args.timeout : 25)]
+        if (args.region) a.push('--region', String(args.region))
+        const r = py('pc.py', a, 120000)
+        return { ok: r.code === 0 && !/not found|timeout/i.test(r.out), out: tail(r.out, 4, 300) }
+      }
+      if (Number.isFinite(args.pixels)) {
+        const r = py('pc.py', ['scroll', '--px', String(Math.trunc(args.pixels))])
+        return { ok: r.code === 0, out: tail(r.out, 3, 200) }
+      }
+      const amount = Number.isFinite(args.amount) ? Math.trunc(args.amount) : -1200
       const r = py('pc.py', ['scroll', String(amount)])
       return { ok: r.code === 0, amount, out: tail(r.out, 4, 300) }
     },
@@ -715,7 +763,7 @@ function applyInner(ctx, config) {
     },
   }))
 
-  mark('tools-registered', { count: registered, expected: 18, failures })
+  mark('tools-registered', { count: registered, expected: 19, failures })
   console.log('[pc-hands] 工具就绪: pc_see / pc_find / pc_click / pc_type / pc_key / pc_windows / pc_task / pc_scan / pc_uia / pc_guard / pc_drag / pc_move / pc_hover / pc_console / pc_close (v0.4.0)')
 }
 

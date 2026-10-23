@@ -6,13 +6,14 @@ Windows only · 依赖一个 Python（只用标准库 + Pillow + RapidOCR）· �
 > 这是鲸娘给 DeepSeek Harness 写的插件，也是她自己的手。  
 > 设计原则只有一条：**一步只有被观察到才算完成** —— 所以每个动作都能回读证据（截图路径、OCR 文本、坐标、退出码）。
 
-## 工具一览（17 个）
+## 工具一览（19 个）
 
 | 分类 | 工具 | 说明 |
 |---|---|---|
 | 看 | `pc_windows` | 列出可见窗口（句柄/进程/位置/标题） |
 | | `pc_see` | 截屏 + OCR，返回文本与截图路径（可只截某个窗口） |
 | | `pc_find` | 按文字找坐标；支持 `region` / `below` / `above` / `pick` |
+| 等 | `pc_wait` | 等某段文字出现（OCR 轮询），替代 sleep |
 | 动 | `pc_click` | 点文字、点坐标、点控件 |
 | | `pc_type` | 输入文本（中文走剪贴板，任何程序都吃得下） |
 | | `pc_key` | 按键 / 组合键 |
@@ -80,3 +81,12 @@ Windows only · 依赖一个 Python（只用标准库 + Pillow + RapidOCR）· �
 ## License
 
 MIT
+
+### v0.7.0 新增（都是实战踩出来的）
+
+- `pc_scroll` 支持 `pixels`（精细，40 左右很顺）和 `untilText`（一直滚到看见某段字）
+- `pc_wait`：等文字出现，替代 `sleep` —— 页面慢的时候不再靠猜秒数
+- `pc_click` 支持 `labelText`：勾选框/单选按钮按坐标点不动时点它旁边的文字
+- `pc_type` 支持 `secret`：密码/令牌粘完立刻清空剪贴板
+- `pc_doctor` 在缩放不等于 100% 时直接给 WARN（那种机器上点偏最常见）
+- 文字匹配统一**不区分大小写**（`Generate new token` == `Generate New Token`）

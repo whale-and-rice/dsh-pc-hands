@@ -1,0 +1,14 @@
+# dsh-pc-hands bundle patch
+#
+# 只挂一个宿主插件：注册 pc_see / pc_find / pc_click / pc_type / pc_key /
+# pc_windows / pc_task 七个工具。pcDir / pythonPath 可以在 profile 的
+# cordis.patch.yml 里覆盖，默认指向本机的脚本目录与运行时 python。
+#
+# name 必须是真实包名（dsh-pc-hands），cordis 按 name 去 import。
+- insert:
+    - id: pc-hands
+      name: dsh-pc-hands
+      config:
+        pcDir: C:\Users\35629\OllamaStart\pc
+        pythonPath: D:\dsh2\resources\runtime\primary-runtime\dependencies\python\python.exe
+        timeoutMs: 120000

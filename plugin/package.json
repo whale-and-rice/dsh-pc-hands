@@ -1,0 +1,46 @@
+{
+    "name": "dsh-pc-hands",
+    "version": "0.6.0",
+    "description": "给鲸娘一双手和一双眼睛：截屏+OCR、按文字点、打字按键、滚轮与剪贴板、以及可验证的多步任务执行（dsh plugin）",
+    "type": "module",
+    "main": "index.js",
+    "license": "MIT",
+    "files": [
+        "index.js",
+        "cordis.patch.yml",
+        "README.md"
+    ],
+    "keywords": [
+        "rapidocr",
+        "dsh-plugin",
+        "dsh-pc-hands",
+        "computer-use",
+        "ocr",
+        "uia",
+        "windows",
+        "gui-automation"
+    ],
+    "engines": {
+        "node": ">=22"
+    },
+    "peerDependencies": {
+        "@deepseek-ai/dsh-tools": "*"
+    },
+    "dsh": {
+        "bundle": {
+            "patch": "./cordis.patch.yml"
+        }
+    },
+    "author": "whale-and-rice",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/whale-and-rice/dsh-pc-hands.git"
+    },
+    "bugs": {
+        "url": "https://github.com/whale-and-rice/dsh-pc-hands/issues"
+    },
+    "homepage": "https://github.com/whale-and-rice/dsh-pc-hands",
+    "os": [
+        "win32"
+    ]
+}

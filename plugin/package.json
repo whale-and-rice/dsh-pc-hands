@@ -1,14 +1,16 @@
 {
     "name": "dsh-pc-hands",
-    "version": "0.6.0",
-    "description": "给鲸娘一双手和一双眼睛：截屏+OCR、按文字点、打字按键、滚轮与剪贴板、以及可验证的多步任务执行（dsh plugin）",
+    "version": "0.6.1",
+    "description": "给 AI agent 一双手和一双眼睛：截屏 OCR / 按文字点 / 键鼠 / 滚轮 / 剪贴板 / 多步任务（Windows，DSH 插件，18 个工具）",
     "type": "module",
     "main": "index.js",
     "license": "MIT",
     "files": [
         "index.js",
         "cordis.patch.yml",
-        "README.md"
+        "README.md",
+        "LICENSE",
+        "pc/"
     ],
     "keywords": [
         "rapidocr",

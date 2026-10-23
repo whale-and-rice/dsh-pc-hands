@@ -35,6 +35,7 @@ const HOMEDIR = homedir()
 // 脚本目录：config → 环境变量 → 本机常见位置 → 家目录下的 dsh-pc-hands
 const DIR_CANDIDATES = [
   process.env.DSH_PC_DIR,
+  join(__dirname, 'pc'),               // 随插件一起 npm 安装时，脚本就在包内
   join(HOMEDIR, 'OllamaStart', 'pc'),
   join(HOMEDIR, 'dsh-pc-hands', 'pc'),
   join(HOMEDIR, '.dsh', 'pc-hands'),

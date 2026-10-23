@@ -8,13 +8,32 @@
 
 ---
 
-## 30 秒装
+## 装的三种方式
+
+### ① 下载解压（最稳，推荐）
+
+从 [Releases](https://github.com/whale-and-rice/dsh-pc-hands/releases) 下 `dsh-pc-hands-*.zip`，解压后双击：
 
 ```bat
-:: 1) 解压后双击，或者命令行跑：
 setup.cmd                 :: 装脚本 + Pillow（不需要管理员）
 setup.cmd -WithOCR        :: 顺便装 RapidOCR（识别质量明显更好，约 100MB）
 setup.cmd -InstallPlugin  :: 顺便注册进 DSH profile
+```
+
+### ② npm（等发布后可用）
+
+```bash
+npm i dsh-pc-hands
+```
+
+包内自带 `pc/` 脚本；插件会优先用包里的那份，没有才回落到 `~/OllamaStart/pc`。
+装完仍需把插件注册进 DSH profile（或手动 `-InstallPlugin`）。
+
+### ③ 直接从 CDN 取单文件（不装任何东西）
+
+```bash
+# 例如把最新版脚本拉到本地
+curl -L https://cdn.jsdelivr.net/gh/whale-and-rice/dsh-pc-hands@v0.6.1/pc/pc.py -o pc.py
 ```
 
 装完 **重启 DSH**，然后让 agent 跑一次 `pc_doctor`：

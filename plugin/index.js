@@ -256,6 +256,7 @@ function applyInner(ctx, config) {
     parameters: {
       window: { type: 'string', description: '窗口标题子串（可选）' },
       name: { type: 'string', description: '截图文件名的前缀（可选，默认 see）' },
+      region: { type: 'string', description: '只截这一块 x0,y0,x1,y1（可选）。小区域会先放大 2 倍再识别，字反而更准、也快得多' },
     },
     output: { schema: { type: 'json' }, render: (_a, v) => [{ type: 'text', text: v.text || v.error || '' }] },
     execute(args) {
@@ -263,6 +264,7 @@ function applyInner(ctx, config) {
       const out = join(shotsDir, `${args.name || 'see'}-${stamp}.png`)
       const shotArgs = ['shot', '--out', out]
       if (args.window) shotArgs.push('--window', String(args.window))
+      if (args.region) shotArgs.push('--region', String(args.region))
       const shotRes = py('pc.py', shotArgs)
       const ocrRes = py('pc.py', ['ocr', '--image', out])
       const lines = ocrRes.out.split(/\r?\n/).filter((l) => l.trim() && !l.includes('saved ') && !l.startsWith('  ok='))
@@ -313,6 +315,11 @@ function applyInner(ctx, config) {
       above: { type: 'string', description: '只点这个短语上方的（可选）' },
       region: { type: 'string', description: '像素区域 x0,y0,x1,y1（可选）' },
       pick: { type: 'string', description: 'first / top / last / bottom（默认 first）' },
+      near: { type: 'string', description: '锚文字：以这段字为基准，按 dir+dy/dx 偏移后点击（可选，比硬编坐标稳）' },
+      dir: { type: 'string', description: 'near 的方向：down / up / left / right（默认 down）' },
+      dy: { type: 'number', description: 'near 的纵向偏移像素（默认 30）' },
+      dx: { type: 'number', description: 'near 的横向偏移像素（默认 0）' },
+      verify: { type: 'string', description: '点完在这些字上验证（可选）：没出现就算失败，会报错而不是假装成功' },
       x: { type: 'number', description: '坐标 x' },
       y: { type: 'number', description: '坐标 y' },
       window: { type: 'string', description: '窗口标题子串（UIA 方式或先激活）' },
@@ -327,6 +334,18 @@ function applyInner(ctx, config) {
         const res = py('pc.py', a, 90000)
         return { ok: /clicked label/i.test(res.out), message: tail(res.out, 5, 400) }
       }
+      if (args.near) {
+        const a = ['click', '--near', String(args.near)]
+        if (args.dir) a.push('--dir', String(args.dir))
+        if (Number.isFinite(args.dy)) a.push('--dy', String(args.dy))
+        if (Number.isFinite(args.dx)) a.push('--dx', String(args.dx))
+        if (args.pick) a.push('--pick', String(args.pick))
+        if (args.region) a.push('--region', String(args.region))
+        if (args.verify) a.push('--verify', String(args.verify))
+        if (Number.isFinite(args.timeout)) a.push('--timeout', String(args.timeout))
+        const res = py('pc.py', a, 90000)
+        return { ok: res.code === 0, message: tail(res.out, 8, 700) }
+      }
       if (args.text) {
         const res = py('pc.py', ['clicktext', String(args.text), ...narrowArgs(args)])
         return { ok: res.code === 0, message: tail(res.out, 8, 700) }
@@ -334,7 +353,8 @@ function applyInner(ctx, config) {
       if (typeof args.x === 'number' && typeof args.y === 'number') {
         const a = ['click', String(Math.round(args.x)), String(Math.round(args.y))]
         if (args.double) a.push('--double')
-        const res = py('pc.py', a)
+        if (args.verify) a.push('--verify', String(args.verify))
+        const res = py('pc.py', a, 90000)
         return { ok: res.code === 0, message: tail(res.out, 4, 400) }
       }
       if (args.window && args.name) {
@@ -385,14 +405,16 @@ function applyInner(ctx, config) {
     parameters: {
       text: { type: 'string', description: '要等的文字' },
       timeout: { type: 'number', description: '超时秒数（默认 20）' },
-      region: { type: 'string', description: '只在某区域找：x0,y0,x1,y1（可选）' },
+      region: { type: 'string', description: '只在某区域找：x0,y0,x1,y1（可选，小区域更快更准）' },
+      gone: { type: 'boolean', description: '反过来：等这段文字消失（转圈、"请稍候"、进度条）' },
     },
     output: { schema: { type: 'json' }, render: (_a, v) => [{ type: 'text', text: v.text }] },
     execute(args) {
       const a = ['waittext', String(args.text), '--timeout', String(Number.isFinite(args.timeout) ? args.timeout : 20)]
       if (args.region) a.push('--region', String(args.region))
+      if (args.gone) a.push('--gone')
       const r = py('pc.py', a, 180000)
-      const ok = /found '/i.test(r.out)
+      const ok = args.gone ? /gone: .* disappeared/i.test(r.out) : /found '/i.test(r.out)
       return { ok, text: tail(r.out, 3, 300) }
     },
   }))

@@ -90,3 +90,24 @@ MIT
 - `pc_type` 支持 `secret`：密码/令牌粘完立刻清空剪贴板
 - `pc_doctor` 在缩放不等于 100% 时直接给 WARN（那种机器上点偏最常见）
 - 文字匹配统一**不区分大小写**（`Generate new token` == `Generate New Token`）
+
+## v0.8.0（2026-10-24）· 按"实际用了两天"的痛点加的
+
+这四条都来自 TIA / EET 联调里的真实翻车：
+
+| 新东西 | 解决什么 | 证据 |
+| --- | --- | --- |
+| `pc_see --region x0,y0,x1,y1` | 截图总是全屏再自己裁，来回好几趟 | 今天裁了十几次；区域截屏后小图还会**放大 2 倍再识别**（「外部源文件」整屏被读成「外部源件」，区域放大后正确） |
+| `pc_click --near 锚文字 --dir down --dy 40` | 手算坐标点偏（TIA 菜单项随重绘移动几像素） | 今天点偏 6 次，其中「从源生成块」偏 20px 就点成了「交叉引用」 |
+| `pc_click --verify 文字` | 点完不知道成没成，只能再截一张看 | 点完自动 OCR 附近区域，没出现就报失败 |
+| `pc_wait --gone 文字` | 只会等文字出现，不会等它消失 | 论坛下载的"请稍候"、编译进度都得等消失 |
+| `pc_wait --region ...` | 整屏 OCR 会吞字，等不到 | 同上，「外部源文件」整屏漏字、区域 0.4 秒命中 |
+
+命令行等价：
+
+```powershell
+python pc.py shot --out r.png --region 40,410,320,560 --ocr
+python pc.py click --near "外部源文件" --dir down --dy 0 --region 40,410,320,560
+python pc.py click 800,600 --verify "已保存"
+python pc.py waittext "请稍候" --gone --timeout 30 --region 400,300,900,700
+```

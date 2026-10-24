@@ -1,6 +1,6 @@
 {
     "name": "dsh-pc-hands",
-    "version": "0.7.0",
+    "version": "0.8.0",
     "description": "给 AI agent 一双手和一双眼睛：截屏 OCR / 按文字点 / 精细滚动 / 等文字出现 / 键鼠剪贴板 / 多步任务（Windows，DSH 插件，19 个工具）",
     "type": "module",
     "main": "index.js",
@@ -8,7 +8,9 @@
     "files": [
         "index.js",
         "cordis.patch.yml",
-        "README.md"
+        "README.md",
+        "LICENSE",
+        "pc/"
     ],
     "keywords": [
         "rapidocr",

@@ -160,10 +160,18 @@ def windows():
     return rows
 
 
-def shot(out="shot.png", window=None):
+def shot(out="shot.png", window=None, region=None):
+    """Screenshot the screen, one window, or just a rectangle.
+
+    region=(x0, y0, x1, y1) in screen pixels. Cropping here instead of in PIL
+    afterwards saves a round trip and keeps the OCR call small (full screen
+    takes ~4 s with RapidOCR, a small region well under 1 s).
+    """
     from PIL import ImageGrab
     box = None
-    if window and str(window).isdigit():
+    if region:
+        box = tuple(int(v) for v in region)
+    elif window and str(window).isdigit():
         hwnd = int(window)
         if user32.IsIconic(hwnd):
             user32.ShowWindow(hwnd, SW_RESTORE)
@@ -175,7 +183,8 @@ def shot(out="shot.png", window=None):
         box = (r.left, r.top, r.right, r.bottom)
     img = ImageGrab.grab(bbox=box, all_screens=True)
     img.save(out)
-    print(f"  saved {out}  {img.size[0]}x{img.size[1]}" + (f"  window={window}" if window else "  (full screen)"))
+    where = f"  region={tuple(box)}" if region else (f"  window={window}" if window else "  (full screen)")
+    print(f"  saved {out}  {img.size[0]}x{img.size[1]}{where}")
     return out
 
 
@@ -1144,14 +1153,66 @@ def main(argv):
     if cmd == "windows":
         windows()
     elif cmd == "shot":
-        window = None
-        out = "shot.png"
-        for i, a in enumerate(args):
-            if a == "--window":
-                window = args[i + 1]
-            elif a == "--out":
-                out = args[i + 1]
-        shot(out, window)
+        window, out, region, do_ocr = None, "shot.png", None, False
+        i = 0
+        while i < len(args):
+            if args[i] == "--window":
+                window = args[i + 1]; i += 2
+            elif args[i] == "--out":
+                out = args[i + 1]; i += 2
+            elif args[i] == "--region":
+                region = [int(float(v)) for v in args[i + 1].split(",")]; i += 2
+            elif args[i] == "--ocr":
+                do_ocr = True; i += 1
+            else:
+                i += 1
+        shot(out, window, region=region)
+        if do_ocr:
+            print("  --- ocr ---")
+            blob = region_text(region, image=out) if region else "".join(
+                "".join(w["t"].split()) for w in (ocr_best(out).get("words") or []))
+            print("  " + (blob[:1200] if blob else "(no text)"))
+    elif cmd == "click" and "--near" in args:
+        # click --near 锚文字 [--dir down|up|left|right] [--dy 30] [--dx 0]
+        #       [--pick first|last|top|bottom] [--region x0,y0,x1,y1]
+        #       [--verify 文字] [--vregion x0,y0,x1,y1] [--vtimeout 3] [--timeout 5]
+        d = {"dir": "down", "dy": 30, "dx": 0, "pick": "first", "region": None,
+             "verify": None, "vregion": None, "vtimeout": 3.0, "timeout": 0.0}
+        anchor, i = None, 0
+        while i < len(args):
+            a = args[i]
+            if a in ("--dir", "--pick", "--verify"):
+                d[a[2:]] = args[i + 1]; i += 2
+            elif a in ("--dy", "--dx"):
+                d[a[2:]] = int(float(args[i + 1])); i += 2
+            elif a in ("--vtimeout", "--timeout"):
+                d[a[2:]] = float(args[i + 1]); i += 2
+            elif a in ("--region", "--vregion"):
+                d[a[2:]] = [int(float(v)) for v in args[i + 1].split(",")]; i += 2
+            elif a == "--near":
+                anchor = args[i + 1]; i += 2
+            else:
+                i += 1
+        near_click(anchor, dirn=d["dir"], dx=d["dx"], dy=d["dy"], pick=d["pick"],
+                   region=d["region"], timeout=d["timeout"], verify=d["verify"],
+                   vregion=d["vregion"], vtimeout=d["vtimeout"])
+    elif cmd == "click" and "--verify" in args:
+        # click x y --verify 文字 [--vregion ...] [--vtimeout 3] [--double]
+        verify, vregion, vtimeout = "", None, 3.0
+        nums, i = [], 0
+        while i < len(args):
+            if args[i] == "--verify":
+                verify = args[i + 1]; i += 2
+            elif args[i] == "--vregion":
+                vregion = [int(float(v)) for v in args[i + 1].split(",")]; i += 2
+            elif args[i] == "--vtimeout":
+                vtimeout = float(args[i + 1]); i += 2
+            elif args[i].startswith("--"):
+                i += 1
+            else:
+                nums.append(int(float(args[i]))); i += 1
+        click_verify(nums[0], nums[1], verify, vregion=vregion, vtimeout=vtimeout,
+                     double="--double" in flags)
     elif cmd == "move":
         move(pos[0], pos[1])
     elif cmd == "click":
@@ -1262,13 +1323,22 @@ def main(argv):
                 st = int(args[i + 1])
         scroll_to(pos[0], timeout=to, region=rg, step=st)
     elif cmd == "waittext":
-        rg, to = None, 20.0
+        rg, to, gone = None, 20.0, False
         for i, a in enumerate(args):
             if a == "--region":
                 rg = tuple(int(v) for v in args[i + 1].split(","))
             elif a == "--timeout":
                 to = float(args[i + 1])
-        wait_text(pos[0], timeout=to, region=rg)
+            elif a == "--gone":
+                gone = True
+        if gone:
+            ok = wait_gone(pos[0], timeout=to, region=rg)
+            if not ok:
+                raise SystemExit(3)
+        else:
+            ok = wait_text(pos[0], timeout=to, region=rg)
+            if not ok:
+                raise SystemExit(3)
     elif cmd == "clicklabel":
         rg = None
         if "--region" in args:
@@ -1551,6 +1621,112 @@ def screen_text(region=None):
     return data.get("lines") or [], data.get("words") or []
 
 
+def region_text(region, image=None, scale=1):
+    """OCR just one rectangle of the screen and return it as one flat string.
+
+    Used by --verify and by --gone: the judgement is "does this region say X",
+    so there is no reason to pay for a full-screen OCR (4 s vs under 1 s).
+
+    If `image` is given it is assumed to be ALREADY cropped to that region
+    (i.e. it came from shot(..., region=...)), so it is OCR'd as a whole.
+    """
+    p = image or os.path.join(tempfile.gettempdir(), "_region_text.png")
+    if image is None:
+        shot(p, region=region)
+    # 小区域里的字太小，OCR 会吞字（实测「外部源文件」被读成「外部源件」）——
+    # 宽 < 700 时先放大两倍再识别，这一步比换引擎更有效。
+    try:
+        from PIL import Image
+        im = Image.open(p)
+        if im.size[0] < 700:
+            big = p.replace(".png", "_2x.png")
+            im.resize((im.size[0] * 2, im.size[1] * 2), Image.LANCZOS).save(big)
+            p = big
+    except Exception:
+        pass
+    data = ocr_best(p)
+    if not data.get("ok"):
+        return ""
+    return "".join("".join(w.get("t", "").split()) for w in data.get("words", []))
+
+
+def near_click(anchor, dirn="down", dx=0, dy=30, pick="first", region=None,
+               timeout=0.0, verify=None, vregion=None, vtimeout=3.0):
+    """Click a fixed offset from a piece of text, instead of a guessed pixel.
+
+    TIA taught this the hard way: the menu item "从源生成块" is 40 px below the
+    row it belongs to, and every re-render moved it by a few pixels. Anchoring on
+    the text and offsetting is stable; hard-coded coordinates are not.
+
+    dirn: down / up / left / right. dy/dx are the offsets in pixels.
+    """
+    t0 = time.time()
+    while True:
+        hit = find_text(anchor, region=region, pick=pick)
+        if hit:
+            break
+        if time.time() - t0 >= timeout:
+            raise SystemExit(f"  near_click: anchor {anchor!r} not found (timeout {timeout}s)")
+        time.sleep(0.8)
+    ax, ay = hit
+    if dirn == "down":
+        x, y = ax + dx, ay + dy
+    elif dirn == "up":
+        x, y = ax + dx, ay - dy
+    elif dirn == "left":
+        x, y = ax - dx, ay + dy
+    else:
+        x, y = ax + dx, ay + dy
+    print(f"  near_click: anchor {anchor!r} at ({ax},{ay}) -> click ({x},{y}) dir={dirn}")
+    click(x, y)
+    if verify:
+        vreg = vregion or (x - 220, y - 60, x + 220, y + 90)
+        ok = wait_text(verify, timeout=vtimeout, region=vreg)
+        if not ok:
+            raise SystemExit(f"  near_click: clicked but {verify!r} never appeared near ({x},{y})")
+    return x, y
+
+
+def click_verify(x, y, verify, vregion=None, vtimeout=3.0, double=False):
+    """Click, then read a small region to prove the click did something."""
+    click(x, y, double=double)
+    vreg = vregion or (int(x) - 220, int(y) - 80, int(x) + 260, int(y) + 110)
+    ok = wait_text(verify, timeout=vtimeout, region=vreg)
+    if not ok:
+        raise SystemExit(f"  click_verify: after clicking ({x},{y}) the text {verify!r} is not in {vreg}")
+    print(f"  click_verify: ({x},{y}) confirmed by {verify!r}")
+    return True
+
+
+def _seen(text, region):
+    """Is `text` on screen right now? With a region, crop+upscale first."""
+    needle = _norm(text)
+    if not needle:
+        return False
+    if region:
+        blob = _norm(region_text(region))
+    else:
+        try:
+            lines, _words = screen_text(None)
+        except Exception:
+            lines = []
+        blob = _norm("".join(lines))
+    return needle in blob
+
+
+def wait_gone(text, timeout=30.0, region=None, interval=0.7):
+    """Wait until a phrase disappears (busy cursors, "请稍候", progress text)."""
+    t0 = time.time()
+    while True:
+        if not _seen(text, region):
+            print(f"  gone: {text!r} disappeared after {time.time() - t0:.1f}s")
+            return True
+        if time.time() - t0 >= timeout:
+            print(f"  timeout after {timeout}s: {text!r} still there")
+            return False
+        time.sleep(interval)
+
+
 def wait_text(text, timeout=20.0, region=None, interval=0.7):
     """等到屏幕（或某块区域）出现这段文字为止。
 
@@ -1559,11 +1735,7 @@ def wait_text(text, timeout=20.0, region=None, interval=0.7):
     needle = _norm(text)
     t0 = time.time()
     while True:
-        try:
-            lines, _words = screen_text(region)
-        except Exception:
-            lines = []
-        if needle and needle in _norm("".join(lines)):
+        if _seen(text, region):
             print(f"  found '{text}' after {time.time() - t0:.1f}s")
             return True
         if time.time() - t0 >= timeout:

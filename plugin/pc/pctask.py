@@ -22,7 +22,7 @@ Plan format (all keys optional unless noted):
        {"do": "shot",   "out": "D:/tmp/p1.png", "window": "实验报告本第五次"},
        {"do": "scroll", "notches": -6},
        {"do": "assert", "text_on_screen": "实验要求"},
-       {"do": "notify", "title": "鲸娘", "text": "任务完成"}
+       {"do": "notify", "title": "溟", "text": "任务完成"}
      ]}
 
 CLI:
@@ -222,7 +222,7 @@ def do_sleep(step, log):
 def do_notify(step, log):
     if os.path.exists(NOTIFY):
         subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-                        "-File", NOTIFY, step.get("title", "鲸娘"), step.get("text", "")],
+                        "-File", NOTIFY, step.get("title", "溟"), step.get("text", "")],
                        capture_output=True, timeout=30)
     log("notified")
     return True

@@ -77,6 +77,7 @@ MOUSEEVENTF = {
     "right_down": 0x0008, "right_up": 0x0010,
     "middle_down": 0x0020, "middle_up": 0x0040,
     "wheel": 0x0800,
+    "hwheel": 0x1000,
 }
 KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_UNICODE = 0x0004
@@ -193,17 +194,61 @@ def move(x, y):
     print(f"  pointer -> {int(x)},{int(y)}")
 
 
-def click(x, y, double=False, right=False):
+def click(x, y, double=False, right=False, hold_ms=55, steps=4, activate_first=False,
+          auto_front=True):
+    """A click that actually looks like a human one.
+
+    Three things the old version got wrong, all of which made Qt/self-drawn
+    controls (TIA, a lot of installers) swallow the press:
+      1. SetCursorPos jumps in one go, so the window never receives a
+         WM_MOUSEMOVE and stays "not hovered" -- it ignores the button.
+      2. press and release were issued with zero delay; anything under ~20 ms
+         reads as a twitch and is dropped.
+      3. nothing checked that the target was in front, so the click could land
+         on whatever window happened to be active.
+
+    So: bring the target forward (what a real click does anyway), walk the
+    pointer in small steps, and hold the button briefly.
+    """
+    if activate_first:
+        try:
+            activate(str(int(activate_first)))
+        except Exception:
+            pass
+    elif auto_front:
+        try:
+            root = _window_at(x, y)
+            fg = user32.GetForegroundWindow()
+            # 关键：鼠标下面的窗口如果和前台窗口属于同一个程序（菜单、下拉、弹层
+            # 都是这样），绝不能去激活它——一激活弹出菜单就消失，这一次点击就落空。
+            if root and int(root) != int(fg) and not _same_process(root, fg):
+                activate(str(int(root)))
+                time.sleep(0.12)
+        except Exception:
+            pass
+    # walk in, so the target sees real mouse moves
+    try:
+        sx, sy = user32.GetCursorPos(ctypes.byref(ctypes.wintypes.POINT())) or (None, None)
+    except Exception:
+        sx, sy = None, None
+    if sx is None:
+        steps = 1
+    else:
+        for i in range(1, max(1, steps) + 1):
+            user32.SetCursorPos(int(sx + (x - sx) * i / steps), int(sy + (y - sy) * i / steps))
+            time.sleep(0.015)
     user32.SetCursorPos(int(x), int(y))
-    time.sleep(0.08)
+    time.sleep(0.06)
     down, up = ("right_down", "right_up") if right else ("left_down", "left_up")
     _mouse(MOUSEEVENTF[down])
+    time.sleep(max(0.02, hold_ms / 1000.0))
     _mouse(MOUSEEVENTF[up])
     if double:
-        time.sleep(0.06)
+        time.sleep(0.07)
         _mouse(MOUSEEVENTF[down])
+        time.sleep(max(0.02, hold_ms / 1000.0))
         _mouse(MOUSEEVENTF[up])
-    print(f"  {'right ' if right else ''}{'double-' if double else ''}click at {int(x)},{int(y)}")
+    print(f"  {'right ' if right else ''}{'double-' if double else ''}click at {int(x)},{int(y)} (hold {hold_ms}ms)")
 
 
 
@@ -383,6 +428,10 @@ user32.WindowFromPoint.argtypes = [POINT]
 user32.GetAncestor.restype = ctypes.c_void_p
 user32.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
 user32.GetCursorPos.argtypes = [ctypes.POINTER(POINT)]
+user32.ScreenToClient.restype = ctypes.c_int
+user32.ScreenToClient.argtypes = [ctypes.c_void_p, ctypes.POINTER(POINT)]
+user32.ClientToScreen.restype = ctypes.c_int
+user32.ClientToScreen.argtypes = [ctypes.c_void_p, ctypes.POINTER(POINT)]
 user32.EnumWindows.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
 user32.IsWindowVisible.argtypes = [ctypes.c_void_p]
 user32.PostMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_void_p]
@@ -678,16 +727,23 @@ def hoverclick(hx, hy, text, wait_ms=1800, dry=False, pick="first"):
     return hit
 
 
-def drag(x1, y1, x2, y2, steps=18, hold_ms=0, gap_ms=12):
+def drag(x1, y1, x2, y2, steps=18, hold_ms=120, gap_ms=12):
     """Press, optionally HOLD, then move in small steps and release.
 
-    hold_ms matters for desktop pets: they start their own drag only after the
-    button has been down for a moment, otherwise a press-move-release looks like
-    a click and they do not follow. gap_ms keeps the movements slow enough for
-    the app to receive them as a drag rather than a jump.
+    hold_ms matters for two kinds of target:
+      * desktop pets -- they start their own drag only after the button has been
+        down for a moment, otherwise press-move-release looks like a click;
+      * scrollbar thumbs -- a 10 px wide thumb is easy to miss, and the control
+        wants a real "grab" before it follows.
+    gap_ms keeps the movements slow enough for the app to receive them as a drag
+    rather than a jump. A tiny hover nudge before pressing makes Qt/self-drawn
+    widgets accept the press at all (same reason as click()).
     """
+    # hover nudge: land near the start first, so the window sees a mouse move
+    user32.SetCursorPos(int(x1) - 2, int(y1) - 2)
+    time.sleep(0.03)
     user32.SetCursorPos(int(x1), int(y1))
-    time.sleep(0.12)
+    time.sleep(0.10)
     _mouse(MOUSEEVENTF["left_down"])
     if hold_ms:
         time.sleep(hold_ms / 1000.0)
@@ -697,6 +753,301 @@ def drag(x1, y1, x2, y2, steps=18, hold_ms=0, gap_ms=12):
     time.sleep(0.08)
     _mouse(MOUSEEVENTF["left_up"])
     print(f"  dragged {x1},{y1} -> {x2},{y2} (hold {hold_ms}ms, {steps} steps)")
+
+
+def hscroll(n):
+    """Horizontal wheel -- the reliable way to see what is off to the right.
+
+    Dragging a scrollbar thumb means finding a ~10 px target and grabbing it;
+    MOUSEEVENTF_HWHEEL does the same job with one event. Positive = right.
+    """
+    step = 120
+    for _ in range(abs(int(n))):
+        _mouse(MOUSEEVENTF["hwheel"], data=step if int(n) > 0 else -step)
+        time.sleep(0.04)
+    print(f"  hscrolled {n}")
+
+
+def _patch_gray(region):
+    """40x40 grayscale thumbnail of a region, as a flat list of 0..255 ints."""
+    from PIL import ImageGrab
+    img = ImageGrab.grab(bbox=tuple(int(v) for v in region), all_screens=True)
+    img = img.convert("L").resize((40, 40))
+    return list(img.tobytes())
+
+
+def _patch_diff(a, b):
+    """Mean absolute difference, 0.0 (identical) .. 1.0 (black vs white)."""
+    if not a or not b or len(a) != len(b):
+        return 1.0
+    return sum(abs(x - y) for x, y in zip(a, b)) / (255.0 * len(a))
+
+
+def _around(x, y, pad=90):
+    """A square around the click point, clamped to the virtual screen."""
+    vx = user32.GetSystemMetrics(76)   # SM_XVIRTUALSCREEN
+    vy = user32.GetSystemMetrics(77)
+    vw = user32.GetSystemMetrics(78)
+    vh = user32.GetSystemMetrics(79)
+    return (max(vx, int(x) - pad), max(vy, int(y) - pad),
+            min(vx + vw, int(x) + pad), min(vy + vh, int(y) + pad))
+
+
+def _same_process(a, b):
+    """True when both window handles belong to one process."""
+    try:
+        from ctypes import wintypes
+        pa, pb = wintypes.DWORD(), wintypes.DWORD()
+        user32.GetWindowThreadProcessId(wintypes.HWND(int(a)), ctypes.byref(pa))
+        user32.GetWindowThreadProcessId(wintypes.HWND(int(b)), ctypes.byref(pb))
+        return pa.value != 0 and pa.value == pb.value
+    except Exception:
+        return False
+
+def _foreground_pid():
+    from ctypes import wintypes
+    fg = user32.GetForegroundWindow()
+    p = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(fg, ctypes.byref(p))
+    return p.value
+
+
+def _big_window_of(pid):
+    """Largest visible top-level window of a process: (hwnd, rect)."""
+    from ctypes import wintypes
+    best = [0, None]
+    EnumProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    def cb(hwnd, _):
+        p = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(p))
+        if p.value == pid and user32.IsWindowVisible(hwnd):
+            r = wintypes.RECT()
+            user32.GetWindowRect(hwnd, ctypes.byref(r))
+            area = (r.right - r.left) * (r.bottom - r.top)
+            if area > best[0]:
+                best[0] = area
+                best[1] = (int(hwnd), (r.left, r.top, r.right, r.bottom))
+        return True
+
+    user32.EnumWindows(EnumProc(cb), 0)
+    return best[1] if best[1] else (0, None)
+
+
+def _force_foreground(hwnd):
+    """SetForegroundWindow that also works when another process owns the foreground."""
+    from ctypes import wintypes
+    h = wintypes.HWND(int(hwnd))
+    if int(user32.GetForegroundWindow()) == int(hwnd):
+        return True
+    cur = kernel32.GetCurrentThreadId()
+    fg = user32.GetForegroundWindow()
+    tf = user32.GetWindowThreadProcessId(fg, None)
+    tt = user32.GetWindowThreadProcessId(h, None)
+    user32.AttachThreadInput(cur, tf, True)
+    user32.AttachThreadInput(cur, tt, True)
+    user32.BringWindowToTop(h)
+    user32.SetForegroundWindow(h)
+    user32.SetFocus(h)
+    user32.AttachThreadInput(cur, tt, False)
+    user32.AttachThreadInput(cur, tf, False)
+    time.sleep(0.35)
+    return int(user32.GetForegroundWindow()) == int(hwnd)
+
+
+def _jump_click(x, y, hold_ms=95):
+    """Teleport then click: no movement trail (a trail opens sibling submenus)."""
+    user32.SetCursorPos(int(x), int(y))
+    time.sleep(0.22)
+    _mouse(MOUSEEVENTF["left_down"])
+    time.sleep(max(0.03, hold_ms / 1000.0))
+    _mouse(MOUSEEVENTF["left_up"])
+
+
+def _titled_windows(pid):
+    """Titles of visible top-level windows of a pid (for change detection)."""
+    from ctypes import wintypes
+    out = []
+    EnumProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    def cb(hwnd, _):
+        p = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(p))
+        if p.value == pid and user32.IsWindowVisible(hwnd):
+            n = user32.GetWindowTextLengthW(hwnd)
+            b = ctypes.create_unicode_buffer(n + 1)
+            user32.GetWindowTextW(hwnd, b, n + 1)
+            if b.value:
+                out.append(b.value)
+        return True
+
+    user32.EnumWindows(EnumProc(cb), 0)
+    return out
+
+def menu(menu_title, item, expect=None, pid=None, tries=3, hold_ms=95):
+    """Click a menu title then its item, reliably, and prove something happened.
+
+    Why this exists (2026-11-01): a plain click on a TIA menu item sometimes just
+    closes the dropdown without running it. Three causes were found and all of
+    them are handled here:
+      1. the click auto-activated the popup window -> the menu was cancelled;
+         so nothing here ever changes focus while a menu is open;
+      2. walking the pointer to the item swept over a sibling that owns a
+         submenu -> the submenu stole the click; so the pointer JUMPS, no trail;
+      3. the action needs a selected target in the tree first -> we verify by
+         waiting for a new top-level window whose title contains `expect`.
+    """
+    from ctypes import wintypes
+    if pid is None:
+        pid = _foreground_pid()
+    hwnd, _rect = _big_window_of(pid)
+    if not hwnd:
+        print(f"  menu: pid {pid} 没有可见主窗口")
+        return False
+
+    for attempt in range(1, int(tries) + 1):
+        if not _force_foreground(hwnd):
+            print(f"  menu: 第 {attempt} 次抢前台失败")
+        t = find_text(menu_title, region=None)
+        if t is None:
+            print(f"  menu: 找不到菜单「{menu_title}」")
+            return False
+        _jump_click(t[0], t[1], hold_ms)
+        time.sleep(0.85)
+
+        it = find_text(item)
+        if it is None:
+            print(f"  menu: 第 {attempt} 次菜单没开或找不到「{item}」")
+            continue
+        before = set(_titled_windows(pid))
+        _jump_click(it[0], it[1], hold_ms)
+        time.sleep(2.2 if expect else 0.8)
+
+        if expect:
+            for _ in range(12):
+                now = set(_titled_windows(pid)) - before
+                hit = [w for w in now if expect in w]
+                if hit:
+                    print(f"  menu: {menu_title} -> {item} 生效，弹出「{hit[0]}」")
+                    return True
+                time.sleep(0.4)
+            print(f"  menu: 第 {attempt} 次点了「{item}」但没等到「{expect}」")
+        else:
+            print(f"  menu: {menu_title} -> {item} 已点击")
+            return True
+    return False
+
+def _is_menu_popup(hwnd):
+    """True when hwnd looks like a pop-up menu (dropping a menu must not be focused)."""
+    try:
+        from ctypes import wintypes
+        buf = ctypes.create_unicode_buffer(64)
+        user32.GetClassNameW(wintypes.HWND(hwnd), buf, 64)
+        if buf.value == "#32768":
+            return True
+        GWL_STYLE = -16
+        WS_POPUP = 0x80000000
+        style = user32.GetWindowLongW(wintypes.HWND(hwnd), GWL_STYLE) & 0xFFFFFFFF
+        GW_OWNER = 4
+        owner = user32.GetWindow(wintypes.HWND(hwnd), GW_OWNER)
+        fg = user32.GetForegroundWindow()
+        if (style & WS_POPUP) and owner and int(owner) == int(fg):
+            return True
+    except Exception:
+        pass
+    return False
+
+def _window_at(x, y):
+    """Root window under a screen point, or None.
+
+    2026-10-25: this used to pass `wintypes.POINT`, but WindowFromPoint was
+    declared with this module's own POINT struct, so ctypes raised
+    "expected POINT instance instead of POINT". click() swallowed it inside its
+    try/except -- which silently disabled the auto-front step, and broke
+    clickcheck's third strategy. Both POINTs must be the same class.
+    """
+    h = user32.WindowFromPoint(POINT(int(x), int(y)))
+    if not h:
+        return None
+    root = user32.GetAncestor(h, 2)   # GA_ROOT
+    return root or h
+
+
+def _wm_click(x, y):
+    """Post WM_LBUTTONDOWN/UP straight to the window under the point.
+
+    Last resort for controls that ignore SendInput entirely: convert the screen
+    point to client coordinates and let the message loop do the work.
+    """
+    hwnd = _window_at(x, y)
+    if not hwnd:
+        raise OSError("no window under the point")
+    pt = POINT(int(x), int(y))
+    user32.ScreenToClient(hwnd, ctypes.byref(pt))
+    lp = ((pt.y & 0xFFFF) << 16) | (pt.x & 0xFFFF)
+    user32.PostMessageW(hwnd, 0x0201, 1, lp)      # WM_LBUTTONDOWN, MK_LBUTTON
+    time.sleep(0.05)
+    user32.PostMessageW(hwnd, 0x0202, 0, lp)      # WM_LBUTTONUP
+    print(f"  posted WM_LBUTTON to {hwnd} at client {pt.x},{pt.y}")
+
+
+def clickcheck(x, y, region=None, tries=3):
+    """Click, then LOOK AT THE SCREEN to see whether anything changed.
+
+    The old click() could not tell a successful press from a swallowed one: it
+    printed "click at 300,500" whether or not TIA noticed. So: measure the area,
+    click, measure again, compare.
+
+    Calibration matters, because part of this desktop is always moving (the pet,
+    a clock, a video). So first take two shots 250 ms apart to learn the local
+    noise floor, and only call it "changed" when the difference clearly exceeds
+    that floor. Otherwise an animating pet would report every click as success
+    -- which is exactly the false confidence we are trying to remove.
+
+    Escalates through: normal click -> longer hold -> front the window first ->
+    posted WM_LBUTTON message. Returns True on a visible change.
+    """
+    region = tuple(region) if region else _around(x, y)
+    try:
+        a = _patch_gray(region)
+        time.sleep(0.25)
+        before = _patch_gray(region)
+    except Exception as e:
+        # Locked screen / display asleep: ImageGrab fails and clicks do nothing.
+        # Say so instead of reporting a fake success.
+        print(f"  clickcheck UNVERIFIED: cannot grab the screen ({e}) -- is it locked?")
+        return None
+    noise = _patch_diff(a, before)
+    threshold = max(0.012, noise * 3.0 + 0.004)
+    strategies = [
+        ("normal click", lambda: click(x, y)),
+        ("long hold 220ms", lambda: click(x, y, hold_ms=220, steps=6)),
+        ("front + click", lambda: click(x, y, activate_first=_window_at(x, y))),
+        ("WM_LBUTTON message", lambda: _wm_click(x, y)),
+    ]
+    tried = []
+    for name, act in strategies[:max(1, min(4, tries))]:
+        try:
+            act()
+        except Exception as e:
+            tried.append(f"{name}: error {e}")
+            continue
+        time.sleep(0.38)
+        try:
+            after = _patch_gray(region)
+        except Exception:
+            print(f"  clickcheck UNVERIFIED after {name} (screen grab failed mid-way)")
+            return None
+        d = _patch_diff(before, after)
+        changed = d > threshold
+        tried.append(f"{name}: diff {d:.4f} vs thr {threshold:.4f} -> {'changed' if changed else 'same'}")
+        if changed:
+            print(f"  clickcheck OK via {name} (diff {d:.4f}, noise {noise:.4f})")
+            return True
+        before = after
+    print(f"  clickcheck NO CHANGE at {x},{y} -- {'; '.join(tried)}")
+    return False
+
 
 
 def scroll(n):
@@ -738,12 +1089,196 @@ def _set_clipboard(text: str) -> None:
         user32.CloseClipboard()
 
 
-def type_text(text):
-    """Clipboard paste: the only reliable way to send Chinese into any app."""
+# ================= P0：焦点守卫 / 指纹日志 / 剪贴板卫生 =================
+# 2026-10-29 加的。动机（真实事故）：叫醒 agent 去 TIA 里 Ctrl+A/Ctrl+V，
+# 结果焦点其实在 DSH 聊天窗口，代码粘进了输入框，而 agent 事后截图看到的是
+# TIA，以为成功了 —— 误报成功比不做贵得多。所以：动作前先证明"焦点在这"，
+# 动作后留指纹，没法证明就报错中止。
+import json as _json
+
+_FP_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fingerprint.jsonl")
+
+def _fg_info():
+    """当前前台窗口的指纹：hwnd / pid / 标题 / 类名 / owner。"""
+    try:
+        h = int(user32.GetForegroundWindow())
+    except Exception:
+        return {"hwnd": 0, "pid": 0, "title": "", "cls": "", "owner": 0}
+    pid = wintypes.DWORD(0)
+    try:
+        user32.GetWindowThreadProcessId(h, ctypes.byref(pid))
+    except Exception:
+        pass
+    def _text(hn):
+        if not hn:
+            return ""
+        n = 256
+        buf = ctypes.create_unicode_buffer(n)
+        user32.GetWindowTextW(hn, buf, n)
+        return buf.value or ""
+    def _class(hn):
+        if not hn:
+            return ""
+        buf = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hn, buf, 256)
+        return buf.value or ""
+    try:
+        owner = int(user32.GetWindow(h, 4))  # GW_OWNER
+    except Exception:
+        owner = 0
+    return {
+        "hwnd": h,
+        "pid": int(pid.value),
+        "title": _text(h),
+        "cls": _class(h),
+        "owner": owner,
+        "owner_title": _text(owner) if owner else "",
+    }
+
+def _fingerprint():
+    info = _fg_info()
+    try:
+        clip_len = len(clip_get_str() or "")
+    except Exception:
+        clip_len = -1
+    info["clip"] = clip_len
+    return info
+
+def _fp(action, before, after, **extra):
+    rec = {
+        "t": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "action": action,
+        "before": before,
+        "after": after,
+    }
+    rec.update(extra)
+    try:
+        with open(_FP_LOG, "a", encoding="utf-8") as f:
+            f.write(_json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+def _match_focus(spec, info):
+    """spec 可以是 hwnd 数字，也可以是标题子串（不区分大小写）。"""
+    if spec is None:
+        return True
+    s = str(spec).strip()
+    if s.isdigit():
+        return info.get("hwnd") == int(s) or info.get("pid") == int(s)
+    return s.lower() in (info.get("title") or "").lower()
+
+def focus_guard(spec, timeout=1.2, quiet=False):
+    """动作前守卫：确认前台是 spec 指定的窗口，不是就抢一次再复核。
+
+    返回 True 表示"可以动手"；False 表示"抢不回来，必须中止"。
+    不会在失败时继续执行动作 —— 这是这套工具最重要的纪律。
+    """
+    if spec is None:
+        return True
+    info = _fg_info()
+    if _match_focus(spec, info):
+        if not quiet:
+            print(f"  focus ok: [{info['pid']}] {info['title'][:60]}")
+        return True
+    # 抢前台（activate 内部已处理 AttachThreadInput 那套）
+    target = None
+    spec_s = str(spec).strip()
+    if spec_s.isdigit():
+        target = int(spec_s)
+    else:
+        try:
+            target = _resolve_window(spec_s)
+        except SystemExit:
+            target = None
+    if target:
+        try:
+            activate(str(target))
+        except Exception as e:
+            if not quiet:
+                print(f"  focus: activate failed: {e}")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        info2 = _fg_info()
+        if _match_focus(spec, info2):
+            if not quiet:
+                print(f"  focus armed: [{info2['pid']}] {info2['title'][:60]}")
+            return True
+        time.sleep(0.12)
+    bad = _fg_info()
+    print(f"  FOCUS_FAILED expect={spec!r} actual=[{bad['pid']}] {bad['title'][:60]!r} "
+          f"owner={bad.get('owner_title','')[:40]!r}")
+    return False
+
+_EXPECT = {"v": None}
+
+
+def _expect_of(argv):
+    """从命令行里取 --expect 的值（窗口标题子串或 hwnd）。"""
+    if _EXPECT["v"] is not None:
+        return _EXPECT["v"]
+    for i, a in enumerate(argv):
+        if a == "--expect" and i + 1 < len(argv):
+            return argv[i + 1]
+    return None
+
+def clip_get_str():
+    import ctypes as _c
+    from ctypes import wintypes as _w
+    u = _c.windll.user32
+    k = _c.windll.kernel32
+    u.OpenClipboard.argtypes = [_w.HWND]
+    u.GetClipboardData.restype = _w.HANDLE
+    u.GetClipboardData.argtypes = [_w.UINT]
+    k.GlobalLock.restype = _c.c_void_p
+    k.GlobalLock.argtypes = [_w.HANDLE]
+    k.GlobalUnlock.argtypes = [_w.HANDLE]
+    if not u.OpenClipboard(None):
+        return None
+    try:
+        h = u.GetClipboardData(13)  # CF_UNICODETEXT
+        if not h:
+            return ""
+        p = k.GlobalLock(h)
+        if not p:
+            return ""
+        try:
+            return _c.wstring_at(p)
+        finally:
+            k.GlobalUnlock(h)
+    finally:
+        u.CloseClipboard()
+
+# =======================================================================
+
+def type_text(text, expect=None):
+    """剪贴板粘贴（中文唯一可靠路径）。P0：备份剪贴板 → 粘贴 → 校验 → 复原。"""
+    before = _fingerprint()
+    if not focus_guard(expect, quiet=True):
+        print("  abort: 焦点不在目标窗口，拒绝粘贴（避免把内容粘进别处）")
+        return False
+    bak = clip_get_str()
     _set_clipboard(text)
     time.sleep(0.12)
+    if (clip_get_str() or "") != text:
+        _set_clipboard(text)
+        time.sleep(0.10)
     _key(VK["ctrl"]); _key(VK["v"]); _key(VK["v"], up=True); _key(VK["ctrl"], up=True)
-    print(f"  typed {len(text)} chars (pasted)")
+    time.sleep(0.15)
+    after = _fingerprint()
+    same = after.get("hwnd") == before.get("hwnd")
+    # 复原剪贴板（原来是空就清空，绝不留代码在剪贴板里）
+    try:
+        _set_clipboard(bak if bak else "")
+    except Exception:
+        pass
+    _fp("type", before, after,
+        chars=len(text), focus_kept=same, head=text[:40],
+        ok=(same and (after.get("title") or "") == (before.get("title") or "")))
+    if not same:
+        print("  WARN: 粘贴期间前台窗口变了，内容可能落到别处")
+        return False
+    print(f"  typed {len(text)} chars (pasted, clipboard restored)")
+    return True
 
 
 def key(name):
@@ -1141,6 +1676,79 @@ def click_text(needle, image=None, **kw):
     return hit
 
 
+# ---------------------------------------------------------------- 界面变化判定
+# 思路抄自别人（dsh-cua 的 ④验证）：两张截图缩到 48x48 灰度，逐格比亮度。
+# 目的只有一个 —— 别再拿"我点了"当"它变了"。这里给的是可核算的数。
+GRID = 48
+CELL_DIFF = 10          # 单格亮度差超过这个值，算这一格变了
+CHANGED_FRAC = 0.02     # 变了的格子占比超过 2%，才算界面有反应
+
+
+def _gray_sig(path):
+    from PIL import Image
+    im = Image.open(path).convert("L").resize((GRID, GRID), Image.BILINEAR)
+    return list(im.tobytes())
+
+
+def changed_score(before, after):
+    a, b = _gray_sig(before), _gray_sig(after)
+    n = len(a)
+    hit = sum(1 for x, y in zip(a, b) if abs(x - y) >= CELL_DIFF)
+    diff = sum(abs(x - y) for x, y in zip(a, b)) / float(n)
+    return hit / float(n), diff
+
+
+def cmd_changed(args):
+    """pc.py changed --before A.png --after B.png [--min 0.02]
+       pc.py changed --baseline B.png [--window N] [--min 0.02]
+
+    第二种是"滚动基线"：拍现在，和 B 比，然后把 B 覆盖成现在，方便连续调用。
+    输出里 changed=1/0 是第一判据，frac 是变了多少格，mean 是平均亮度差。
+    退出码：0 = 界面变了；2 = 没变。
+    """
+    before = after = baseline = window = None
+    min_frac = CHANGED_FRAC
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--before" and i + 1 < len(args):
+            before = args[i + 1]; i += 2
+        elif a == "--after" and i + 1 < len(args):
+            after = args[i + 1]; i += 2
+        elif a == "--baseline" and i + 1 < len(args):
+            baseline = args[i + 1]; i += 2
+        elif a == "--window" and i + 1 < len(args):
+            window = args[i + 1]; i += 2
+        elif a == "--min" and i + 1 < len(args):
+            min_frac = float(args[i + 1]); i += 2
+        else:
+            i += 1
+
+    if baseline:
+        import tempfile
+        cur = os.path.join(tempfile.gettempdir(), "pc-changed-now.png")
+        shot(cur, window)
+        if not os.path.exists(baseline):
+            import shutil
+            shutil.copyfile(cur, baseline)
+            print(f"  changed=0 frac=0.0000 mean=0.00 baseline=NEW {baseline}")
+            return 0
+        frac, diff = changed_score(baseline, cur)
+        import shutil
+        shutil.copyfile(cur, baseline)       # 滚动：这次的结果成为下次的基线
+        is_changed = frac >= min_frac
+        print(f"  changed={1 if is_changed else 0} frac={frac:.4f} mean={diff:.2f} "
+              f"min={min_frac:.3f} baseline={baseline}")
+        return 0 if is_changed else 2
+
+    if not before or not after:
+        raise SystemExit("  changed: need --before A --after B  (or --baseline B)")
+    frac, diff = changed_score(before, after)
+    is_changed = frac >= min_frac
+    print(f"  changed={1 if is_changed else 0} frac={frac:.4f} mean={diff:.2f} min={min_frac:.3f}")
+    return 0 if is_changed else 2
+
+
 
 
 def main(argv):
@@ -1148,9 +1756,29 @@ def main(argv):
         print(__doc__)
         return
     cmd, args = argv[0], argv[1:]
+    # P0：--expect <值> 是守卫参数，不参与位置参数解析
+    _clean, _ex = [], None
+    _i = 0
+    while _i < len(args):
+        if args[_i] == "--expect" and _i + 1 < len(args):
+            _ex = args[_i + 1]
+            _i += 2
+            continue
+        _clean.append(args[_i])
+        _i += 1
+    args = _clean
+    _EXPECT["v"] = _ex
     flags = [a for a in args if a.startswith("--")]
     pos = [a for a in args if not a.startswith("--")]
-    if cmd == "windows":
+    if cmd == "focus":
+        info = _fingerprint()
+        print("  hwnd=%s pid=%s clip=%s" % (info["hwnd"], info["pid"], info["clip"]))
+        print("  title=%r" % (info["title"],))
+        print("  class=%r owner=%r" % (info["cls"], info["owner_title"]))
+        if len(args) > 1:
+            ok = focus_guard(args[1], quiet=False)
+            sys.exit(0 if ok else 4)
+    elif cmd == "windows":
         windows()
     elif cmd == "shot":
         window, out, region, do_ocr = None, "shot.png", None, False
@@ -1172,6 +1800,9 @@ def main(argv):
             blob = region_text(region, image=out) if region else "".join(
                 "".join(w["t"].split()) for w in (ocr_best(out).get("words") or []))
             print("  " + (blob[:1200] if blob else "(no text)"))
+    elif cmd == "changed":
+        # 界面到底变没变：48x48 灰度差分，给数不给感觉
+        sys.exit(cmd_changed(args))
     elif cmd == "click" and "--near" in args:
         # click --near 锚文字 [--dir down|up|left|right] [--dy 30] [--dx 0]
         #       [--pick first|last|top|bottom] [--region x0,y0,x1,y1]
@@ -1213,10 +1844,39 @@ def main(argv):
                 nums.append(int(float(args[i]))); i += 1
         click_verify(nums[0], nums[1], verify, vregion=vregion, vtimeout=vtimeout,
                      double="--double" in flags)
-    elif cmd == "move":
+    elif cmd == "clickcheck":
+        # clickcheck x y [--region x0,y0,x1,y1] [--tries n]
+        nums, rg, tr = [], None, 3
+        i = 0
+        while i < len(args):
+            a = args[i]
+            if a == "--region" and i + 1 < len(args):
+                rg = tuple(int(v) for v in args[i + 1].split(",")); i += 2
+            elif a == "--tries" and i + 1 < len(args):
+                tr = int(args[i + 1]); i += 2
+            else:
+                try:
+                    nums.append(int(float(a)))
+                except Exception:
+                    pass
+                i += 1
+        if len(nums) < 2:
+            print("  usage: clickcheck x y [--region x0,y0,x1,y1] [--tries n]")
+            sys.exit(2)
+        res = clickcheck(nums[0], nums[1], rg, tr)
+        if res is None:
+            sys.exit(3)      # could not verify (locked screen)
+        if res is False:
+            sys.exit(2)      # clicked but nothing changed    elif cmd == "move":
         move(pos[0], pos[1])
     elif cmd == "click":
+        if not focus_guard(_expect_of(args), quiet=True):
+            print("  abort: focus mismatch, refuse to act")
+            sys.exit(4)
+        before = _fingerprint()
         click(pos[0], pos[1], "--double" in flags, "--right" in flags)
+        time.sleep(0.08)
+        _fp("click", before, _fingerprint(), x=pos[0], y=pos[1])
     elif cmd == "whatis":
         whatis(args[0], args[1])
     elif cmd == "movewin":
@@ -1293,7 +1953,7 @@ def main(argv):
         dragwin(rest[0], int(rest[1]), int(rest[2]), hold_ms=hold, grab=grab)
     elif cmd == "drag":
         # drag x1 y1 x2 y2 [--hold ms] [--steps n] [--gap ms]
-        nums, hold, steps, gap = [], 0, 18, 12
+        nums, hold, steps, gap = [], 120, 18, 12
         i = 0
         while i < len(args):
             a = args[i]
@@ -1311,6 +1971,23 @@ def main(argv):
             scroll_px(int(args[args.index("--px") + 1]))
         else:
             scroll(pos[0])
+    elif cmd == "hscroll":
+        # hscroll N  (positive = right). Move the pointer into the content区 first.
+        px = 0
+        for a in args:
+            try:
+                px = int(float(a))
+            except Exception:
+                pass
+        if "--at" in args:
+            k = args.index("--at")
+            try:
+                x, y = args[k + 1].split(",")[:2]
+                user32.SetCursorPos(int(x), int(y))
+                time.sleep(0.05)
+            except Exception:
+                pass
+        hscroll(px)
     elif cmd == "scrollto":
         # scrollto <文字> [--timeout 秒] [--region x0,y0,x1,y1] [--step 像素]
         rg, to, st = None, 25.0, -90
@@ -1351,14 +2028,29 @@ def main(argv):
     elif cmd == "doctor":
         doctor()
     elif cmd == "type":
+        exp = _expect_of(args)
         if "--secret" in flags:
             type_secret(pos[0] if pos else "")
         else:
-            type_text(args[0] if args and not args[0].startswith("--") else "")
+            txt = args[0] if args and not args[0].startswith("--") else ""
+            if not type_text(txt, expect=exp):
+                sys.exit(4)
     elif cmd == "key":
+        if not focus_guard(_expect_of(args), quiet=True):
+            print("  abort: focus mismatch, refuse to act")
+            sys.exit(4)
+        before = _fingerprint()
         key(pos[0])
+        time.sleep(0.08)
+        _fp("key", before, _fingerprint(), k=pos[0])
     elif cmd == "hotkey":
+        if not focus_guard(_expect_of(args), quiet=True):
+            print("  abort: focus mismatch, refuse to act")
+            sys.exit(4)
+        before = _fingerprint()
         hotkey(pos[0])
+        time.sleep(0.08)
+        _fp("hotkey", before, _fingerprint(), k=pos[0])
     elif cmd == "activate":
         activate(pos[0])
     elif cmd == "find":
@@ -1382,6 +2074,24 @@ def main(argv):
         print(f"  ok={data.get('ok')} engine={data.get('engine', 'windows')} lines={len(data.get('lines', []))}")
         for line in data.get("lines", [])[:25]:
             print("   " + line)
+    elif cmd == "menu":
+        title, item = argv[1], argv[2]
+        expect = None
+        pid = None
+        rest = argv[3:]
+        i = 0
+        while i < len(rest):
+            if rest[i] == "--expect":
+                expect = rest[i + 1]
+                i += 2
+            elif rest[i] == "--pid":
+                pid = int(rest[i + 1])
+                i += 2
+            else:
+                i += 1
+        ok = menu(title, item, expect=expect, pid=pid)
+        print("  menu:", "OK" if ok else "FAILED")
+
     elif cmd == "scanclick":
         # scanclick <x> <y0>-<y1> --verify <text> --vregion x0,y0,x1,y1 [--step N]
         x = int(args[0])

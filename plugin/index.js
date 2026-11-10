@@ -1,5 +1,5 @@
 /**
- * dsh-pc-hands — 给鲸娘一双手和一双眼睛。
+ * dsh-pc-hands — 给溟一双手和一双眼睛。
  *
  * 不和 DSH 的 UI 抢地盘，只注册工具；真正干活的还是 pc 那套脚本
  * （pc.py / uia.ps1 / ocr.ps1 / pctask.py），这里做的事是：
@@ -110,11 +110,17 @@ function tail(text, lines = 40, chars = 6000) {
   return sliced.length > chars ? sliced.slice(-chars) : sliced
 }
 
-// ---- 动键鼠前后的提示 · 2026-10-23 主人提的 ----
-// 一次任务里常常连着好几个工具调用，所以做去抖：
-// 15 秒内只弹一次「开始」，最后一个调用停下 1.8 秒后再弹「做完了」。
+// ---- 动键鼠前后的提示 · 2026-10-23 主人提的，2026-10-30 改 ----
+// 他的原话（10-30 13:53）：「做一件事情的时候中间要操作很多次键鼠，只在开始跟结尾告诉我就好了，不用每点一次就弹。」
+// 所以从「每次动作去抖」改成「按一段连续操作算」：
+//   · 距上一次动作超过 30 秒 → 认为是新一轮 → 弹一次「开始」
+//   · 最后一次动作之后安静 12 秒 → 这一段真的结束了 → 弹一次「做完」
+// 中间不管点多少下，都不再弹。
 const NOTIFY_PS1 = join(homedir(), 'OllamaStart', 'notify.ps1')
+const START_GAP_MS = 30000
+const END_DELAY_MS = 12000
 let lastStartAt = 0
+let lastActionAt = 0
 let endTimer = null
 
 function toast(text) {
@@ -124,7 +130,7 @@ function toast(text) {
     const ps = join(process.env.SystemRoot || 'C:\\Windows',
       'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
     const child = spawn(ps, ['-NoProfile', '-ExecutionPolicy', 'Bypass',
-      '-File', NOTIFY_PS1, '鲸娘', text], { stdio: 'ignore', windowsHide: true })
+      '-File', NOTIFY_PS1, '溟', text], { stdio: 'ignore', windowsHide: true })
     child.on('error', (e) => {
       try {
         writeFileSync(join(DEFAULT_DIR, 'plugin-toast.log'),
@@ -143,18 +149,24 @@ function toast(text) {
 function announceStart(text) {
   if (endTimer) { clearTimeout(endTimer); endTimer = null }
   const now = Date.now()
-  if (now - lastStartAt > 15000) {
+  // 只有「上一段操作已经结束很久」时才算新的一轮，才弹开始
+  if (now - Math.max(lastStartAt, lastActionAt) > START_GAP_MS) {
     lastStartAt = now
     toast(text || '本鲸开始动键鼠了')
   }
+  lastActionAt = now
 }
 
 function announceEnd() {
   if (endTimer) clearTimeout(endTimer)
+  const now = Date.now()
+  lastActionAt = now
   endTimer = setTimeout(() => {
+    // 定时器到点时如果又动了（说明还有动作在路上），就等下一轮
+    if (Date.now() - lastActionAt < END_DELAY_MS - 500) return
     toast('做完了，可以碰屏幕了')
     endTimer = null
-  }, 1800)
+  }, END_DELAY_MS)
   if (endTimer.unref) endTimer.unref()
 }
 
@@ -213,6 +225,7 @@ function applyInner(ctx, config) {
   // 注册失败必须留证据：不然只能看到 apply-enter 就没了（第一次就是这样盲猜的）
   let registered = 0
   const failures = []
+  const registeredNames = []
   // 会动键鼠/窗口的工具：进出都响一声（主人要的「开始有提示、结束也有」）
   const HANDS = new Set([
     'pc_click', 'pc_type', 'pc_key', 'pc_drag', 'pc_move', 'pc_hover',
@@ -235,6 +248,7 @@ function applyInner(ctx, config) {
     try {
       ctx.tools.register(wrapHands(def))
       registered += 1
+      registeredNames.push(def && def.name)
     } catch (error) {
       // Keep the failure instead of letting the final mark overwrite it: a
       // silent drop is exactly how pc_task went missing once already.
@@ -325,6 +339,7 @@ function applyInner(ctx, config) {
       window: { type: 'string', description: '窗口标题子串（UIA 方式或先激活）' },
       name: { type: 'string', description: '控件名（UIA 方式，需要同时给 window）' },
       double: { type: 'boolean', description: '双击' },
+      expect: { type: 'string', description: '焦点守卫（强烈建议填）：目标窗口标题子串或 hwnd。不是前台就先抢前台再复核，抢不回来直接报错中止，绝不盲打。' },
     },
     output: { schema: { type: 'json' }, render: (_a, v) => [{ type: 'text', text: v.message }] },
     execute(args) {
@@ -343,16 +358,20 @@ function applyInner(ctx, config) {
         if (args.region) a.push('--region', String(args.region))
         if (args.verify) a.push('--verify', String(args.verify))
         if (Number.isFinite(args.timeout)) a.push('--timeout', String(args.timeout))
+        if (args.expect) a.push('--expect', String(args.expect))
         const res = py('pc.py', a, 90000)
         return { ok: res.code === 0, message: tail(res.out, 8, 700) }
       }
       if (args.text) {
-        const res = py('pc.py', ['clicktext', String(args.text), ...narrowArgs(args)])
+        const _ct = ['clicktext', String(args.text), ...narrowArgs(args)]
+        if (args.expect) _ct.push('--expect', String(args.expect))
+        const res = py('pc.py', _ct)
         return { ok: res.code === 0, message: tail(res.out, 8, 700) }
       }
       if (typeof args.x === 'number' && typeof args.y === 'number') {
         const a = ['click', String(Math.round(args.x)), String(Math.round(args.y))]
         if (args.double) a.push('--double')
+        if (args.expect) a.push('--expect', String(args.expect))
         if (args.verify) a.push('--verify', String(args.verify))
         const res = py('pc.py', a, 90000)
         return { ok: res.code === 0, message: tail(res.out, 4, 400) }
@@ -372,11 +391,13 @@ function applyInner(ctx, config) {
     parameters: {
       text: { type: 'string', description: '要输入的文字' },
       secret: { type: 'boolean', description: '敏感内容（密码/令牌）：粘完立刻清空剪贴板' },
+      expect: { type: 'string', description: '焦点守卫（强烈建议填）：目标窗口标题子串或 hwnd。不是前台就先抢前台再复核，抢不回来直接报错中止，绝不盲打。' },
     },
     output: { schema: { type: 'json' }, render: (_a, v) => [{ type: 'text', text: v.message }] },
     execute(args) {
       if (!args.text) return { ok: false, message: '需要 text' }
       const a = ['type', String(args.text)]
+      if (args.expect) a.push('--expect', String(args.expect))
       if (args.secret) a.push('--secret')
       const res = py('pc.py', a)
       return { ok: res.code === 0, message: tail(res.out, 4, 400) }
@@ -386,12 +407,18 @@ function applyInner(ctx, config) {
   reg(defineTool({
     name: 'pc_key',
     description: '按键或组合键：enter/esc/tab/pagedown/f2… 或 ctrl+s、ctrl+home 这种组合。',
-    parameters: { keys: { type: 'string', description: '键名或组合，如 pagedown / ctrl+home' } },
+    parameters: {
+      keys: { type: 'string', description: '键名或组合，如 pagedown / ctrl+home' },
+      expect: { type: 'string', description: '焦点守卫（强烈建议填）：目标窗口标题子串或 hwnd。不是前台就先抢前台再复核，抢不回来直接报错中止，绝不盲打。' },
+    },
     output: { schema: { type: 'json' }, render: (_a, v) => [{ type: 'text', text: v.message }] },
     execute(args) {
       if (!args.keys) return { ok: false, message: '需要 keys' }
       const combo = String(args.keys)
-      const res = py('pc.py', [combo.includes('+') ? 'hotkey' : 'key', combo])
+      const _cb = combo.includes('+') ? 'hotkey' : 'key'
+      const _a = [_cb, combo]
+      if (args.expect) _a.push('--expect', String(args.expect))
+      const res = py('pc.py', _a)
       return { ok: res.code === 0, message: tail(res.out, 4, 400) }
     },
   }))
@@ -423,12 +450,15 @@ function applyInner(ctx, config) {
   reg(defineTool({
     name: 'pc_scroll',
     description:
-      '滚动。三种用法：① pixels（精细，40 左右很顺，Chrome/Edge 支持 sub-notch）；'
-      + '② amount（整格，一格 120）；③ untilText（一直往下滚，直到屏幕上出现这段文字为止）。'
+      '滚动。四种用法：① pixels（精细，40 左右很顺，Chrome/Edge 支持 sub-notch）；'
+      + '② amount（整格，一格 120）；③ untilText（一直往下滚，直到屏幕上出现这段文字为止）；'
+      + '④ horizontal（横向滚轮，正右负左）—— 想看"右边有什么"就用这个，不要拖滚动条滑块，'
+      + '那种 10px 宽的东西很难抓准。'
       + '可先给 x/y 把指针移过去。',
     parameters: {
       pixels: { type: 'number', description: '精细滚动量（正上负下，例如 -40）' },
       amount: { type: 'number', description: '整格滚动量（正上负下，例如 -1200）' },
+      horizontal: { type: 'number', description: '横向滚动量（正右负左，例如 3）。给了它就忽略 pixels/amount，改用横向滚轮' },
       untilText: { type: 'string', description: '滚到这段文字出现为止（可选）' },
       timeout: { type: 'number', description: 'untilText 的超时秒数（默认 25）' },
       region: { type: 'string', description: 'untilText 只在某区域找：x0,y0,x1,y1' },
@@ -446,6 +476,15 @@ function applyInner(ctx, config) {
         if (args.region) a.push('--region', String(args.region))
         const r = py('pc.py', a, 120000)
         return { ok: r.code === 0 && !/not found|timeout/i.test(r.out), out: tail(r.out, 4, 300) }
+      }
+      if (Number.isFinite(args.horizontal)) {
+        const n = Math.trunc(args.horizontal)
+        const a = ['hscroll', String(n)]
+        if (Number.isFinite(args.x) && Number.isFinite(args.y)) {
+          a.push('--at', Math.trunc(args.x) + ',' + Math.trunc(args.y))
+        }
+        const r = py('pc.py', a)
+        return { ok: r.code === 0, amount: n, out: tail(r.out, 3, 200) }
       }
       if (Number.isFinite(args.pixels)) {
         const r = py('pc.py', ['scroll', '--px', String(Math.trunc(args.pixels))])
@@ -785,8 +824,10 @@ function applyInner(ctx, config) {
     },
   }))
 
-  mark('tools-registered', { count: registered, expected: 19, failures })
-  console.log('[pc-hands] 工具就绪: pc_see / pc_find / pc_click / pc_type / pc_key / pc_windows / pc_task / pc_scan / pc_uia / pc_guard / pc_drag / pc_move / pc_hover / pc_console / pc_close (v0.4.0)')
+  // 这份 marker 是「DSH 到底收下了哪几个工具」的唯一现场证据：
+  // 只记数量不够（旧 marker 只能看出 19 个），记下名字才能发现「掉了一个、补了一个」这种替换。
+  mark('tools-registered', { count: registered, expected: 19, names: registeredNames, failures })
+  console.log('[pc-hands] 工具就绪 ' + registered + ' 个: ' + registeredNames.join(' / '))
 }
 
 

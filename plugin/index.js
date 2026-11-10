@@ -16,6 +16,10 @@ import { join } from 'node:path'
 import { homedir } from 'node:os'
 
 const MARK = join(homedir(), 'OllamaStart', 'pc', 'plugin-loaded.json')
+// 2026-11-10：toast() 的报错兜底里引用过 DEFAULT_DIR，但这个名字从来没有定义过 ——
+// 通知发不出去时，兜底自己再抛 ReferenceError（其中一处还在 child.on('error') 里，
+// 属于异步未捕获异常，可能把宿主进程带崩）。定义在这里，兜底才真的是兜底。
+const DEFAULT_DIR = join(homedir(), 'OllamaStart', 'pc')
 
 function mark(stage, extra) {
   try {
@@ -86,10 +90,22 @@ function run(conf, args, timeoutMs) {
     encoding: 'utf8',
     timeout: timeoutMs || conf.timeoutMs,
     windowsHide: true,
+    maxBuffer: 32 * 1024 * 1024,
   })
-  const out = ((res.stdout || '') + (res.stderr || '')).trim()
+  // 2026-11-10：以前只看 stdout+stderr，把 res.error（python 路径错 / 起不来）和
+  // 超时被杀（signal）都丢了 —— 于是"根本没跑起来"和"真的没找到目标"在工具返回值里
+  // 长得一模一样，模型会以为屏幕上没这东西，然后开始瞎点。现在把原因顶到输出最前面。
+  const err = res.error ? String(res.error.message || res.error) : ''
+  const timedOut = res.signal === 'SIGTERM'
+  let out = ((res.stdout || '') + (res.stderr || '')).trim()
+  if (err) {
+    const hint = /ENOENT/i.test(err) ? '（python 起不来？跑一次 pc_doctor 看看）' : ''
+    out = `  exec failed: ${err}${hint}\n` + out
+  } else if (timedOut) {
+    out = `  exec timed out after ${Math.round((timeoutMs || conf.timeoutMs) / 1000)}s（已经杀掉，不是"没找到"）\n` + out
+  }
   const code = res.status === null ? -1 : res.status
-  return { code, out }
+  return { code, out, error: err || null, timedOut }
 }
 
 
@@ -99,9 +115,14 @@ function ps(conf, args, timeoutMs) {
     encoding: 'utf8',
     timeout: timeoutMs || conf.timeoutMs,
     windowsHide: true,
+    maxBuffer: 32 * 1024 * 1024,
   })
-  const out = ((res.stdout || '') + (res.stderr || '')).trim()
-  return { code: res.status === null ? -1 : res.status, out }
+  const err = res.error ? String(res.error.message || res.error) : ''
+  const timedOut = res.signal === 'SIGTERM'
+  let out = ((res.stdout || '') + (res.stderr || '')).trim()
+  if (err) out = `  exec failed: ${err}\n` + out
+  else if (timedOut) out = `  exec timed out（已经杀掉）\n` + out
+  return { code: res.status === null ? -1 : res.status, out, error: err || null, timedOut }
 }
 
 function tail(text, lines = 40, chars = 6000) {

@@ -303,8 +303,9 @@ def _grab_screen(hwnd, path):
 
 
 def _printwindow_raw(hwnd, path):
-    out = _printwindow_impl(hwnd, path)
-    return out
+    # 2026-11-10：以前这里调 _printwindow_impl()，那个函数从来不存在 ——
+    # NameError 被调用方的 except 吞掉，于是"后台直接抓窗口"这条路一直在静默回退。
+    return _grab_window(hwnd, path)
 
 
 def _grab_window(hwnd, path):
@@ -375,7 +376,7 @@ def _grab_window_safe(hwnd, path, timeout=4.0):
 
     def work():
         try:
-            box["ok"] = _printwindow_impl(hwnd, path)
+            box["ok"] = _grab_window(hwnd, path)
         except Exception as exc:      # keep the failure, never crash the caller
             box["err"] = exc
 
@@ -573,8 +574,10 @@ def conread(hwnd):
             return ""
         csbi = (ctypes.c_char * 22)()
         kernel32.GetConsoleScreenBufferInfo(handle, ctypes.byref(csbi))
-        width = ctypes.cast(csbi, ctypes.POINTER(ctypes.c_int16))[1]
-        height = ctypes.cast(csbi, ctypes.POINTER(ctypes.c_int16))[0] + 1
+        # 2026-11-10：CONSOLE_SCREEN_BUFFER_INFO 的 dwSize 是 COORD —— [0] 是列宽，[1] 是行数。
+        # 以前读反了，窄控制台（80 列）会被当成几百列去切行，conread 的尾部对不上。
+        width = ctypes.cast(csbi, ctypes.POINTER(ctypes.c_int16))[0]
+        height = ctypes.cast(csbi, ctypes.POINTER(ctypes.c_int16))[1] + 1
         if width <= 0 or width > 400:
             width = 120
         total = width * height
@@ -1867,7 +1870,10 @@ def main(argv):
         if res is None:
             sys.exit(3)      # could not verify (locked screen)
         if res is False:
-            sys.exit(2)      # clicked but nothing changed    elif cmd == "move":
+            sys.exit(2)      # clicked but nothing changed
+    elif cmd == "move":
+        # 2026-11-10：以前这行 elif 被粘在上一行的行尾注释里，
+        # 于是 move 动词整个失踪、而这一句 move() 对 clickcheck 无条件执行（每次校验都把指针挪走）。
         move(pos[0], pos[1])
     elif cmd == "click":
         if not focus_guard(_expect_of(args), quiet=True):

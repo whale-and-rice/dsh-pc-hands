@@ -161,19 +161,89 @@ def windows():
     return rows
 
 
-def shot(out="shot.png", window=None, region=None):
+def _hwnd_for(spec):
+    """window 参数（hwnd 数字，或标题子串）→ hwnd。
+
+    2026-11-14 修：以前 shot() 里只认数字，传标题会**静默退化成全屏截图**，
+    看起来"截到了"，其实拍到的是压在上面的别的窗口。现在标题也能找。
+    """
+    sp = str(spec).strip()
+    if sp.isdigit():
+        return int(sp)
+    low = sp.lower()
+    hit = {"hwnd": None}
+    EnumProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    def cb(hwnd, _):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        n = user32.GetWindowTextLengthW(hwnd)
+        buf = ctypes.create_unicode_buffer(n + 1)
+        user32.GetWindowTextW(hwnd, buf, n + 1)
+        if buf.value.strip() and low in buf.value.lower():
+            hit["hwnd"] = hwnd
+            return False
+        return True
+
+    user32.EnumWindows(EnumProc(cb), 0)
+    if hit["hwnd"] is None:
+        print(f"  abort: 找不到标题含「{sp}」的可见窗口")
+        raise SystemExit(2)
+    return hit["hwnd"]
+
+
+def _img_stats(path):
+    """(宽高, 平均灰度, 灰度标准差)。标准差≈0 就是一张纯色图。"""
+    from PIL import Image, ImageStat
+    im = Image.open(path).convert("L")
+    st = ImageStat.Stat(im)
+    return im.size, float(st.mean[0]), float(st.stddev[0])
+
+
+def _warn_if_blank(path):
+    """截图几乎是纯色时**明确告警**。
+
+    为什么要有这一句：抓一张全黑/全白的图，OCR 一个字也认不出，很容易被
+    读成"窗口里什么都没有"，然后去点一堆不存在的控件。真实原因通常是
+    截不到（最小化窗口、硬件加速浮层、PrintWindow 返回旧帧），不是界面空。
+    """
+    try:
+        size, mean, std = _img_stats(path)
+    except Exception:
+        return False
+    if std < 3.0:
+        print(f"  WARNING: 这张图几乎是纯色（{size[0]}x{size[1]}  std={std:.2f}  mean={mean:.0f}）")
+        print("           通常不是窗口里没内容，而是没截到：窗口最小化 / 硬件加速浮层 / PrintWindow 旧帧")
+        return True
+    return False
+
+
+def shot(out="shot.png", window=None, region=None, bg=False):
     """Screenshot the screen, one window, or just a rectangle.
 
     region=(x0, y0, x1, y1) in screen pixels. Cropping here instead of in PIL
-    afterwards saves a round trip and keeps the OCR call small (full screen
-    takes ~4 s with RapidOCR, a small region well under 1 s).
+    afterwards saves a round trip and keeps the OCR call small.
+
+    2026-11-14 加 bg=True：**不抢焦点**，让窗口自己重绘到内存（PrintWindow）。
+    以前 window= 一律先把窗口提到前台再按屏幕坐标抓——窗口被别的窗口压住时，
+    截到的是压住它的那个，于是"看不见的窗口"永远读不到。bg 专治这个。
+    代价：个别 Electron 窗口 PrintWindow 会给旧帧，所以两种模式都留着。
     """
     from PIL import ImageGrab
     box = None
     if region:
         box = tuple(int(v) for v in region)
-    elif window and str(window).isdigit():
-        hwnd = int(window)
+    elif window is not None:
+        hwnd = _hwnd_for(window)
+        if bg:
+            if user32.IsIconic(hwnd):
+                print("  WARNING: 窗口是最小化的，PrintWindow 只能拿到一条标题栏")
+            if _grab_window(hwnd, out):
+                size, mean, std = _img_stats(out)
+                print(f"  saved {out}  {size[0]}x{size[1]}  window={window}  (bg: PrintWindow, 没抢焦点)")
+                _warn_if_blank(out)
+                return out
+            print("  (PrintWindow 没成功，退回前台屏幕抓取)")
         if user32.IsIconic(hwnd):
             user32.ShowWindow(hwnd, SW_RESTORE)
             time.sleep(0.4)
@@ -186,6 +256,7 @@ def shot(out="shot.png", window=None, region=None):
     img.save(out)
     where = f"  region={tuple(box)}" if region else (f"  window={window}" if window else "  (full screen)")
     print(f"  saved {out}  {img.size[0]}x{img.size[1]}{where}")
+    _warn_if_blank(out)
     return out
 
 
@@ -2293,7 +2364,7 @@ def main(argv):
     elif cmd == "windows":
         windows()
     elif cmd == "shot":
-        window, out, region, do_ocr = None, "shot.png", None, False
+        window, out, region, do_ocr, bg = None, "shot.png", None, False, False
         i = 0
         while i < len(args):
             if args[i] == "--window":
@@ -2304,12 +2375,14 @@ def main(argv):
                 region = [int(float(v)) for v in args[i + 1].split(",")]; i += 2
             elif args[i] == "--ocr":
                 do_ocr = True; i += 1
+            elif args[i] == "--bg":
+                bg = True; i += 1
             else:
                 i += 1
         # 裸路径当 --out 用：以前 `shot D:\x.png` 会静默存成 shot.png，找图时白等一场
         if pos and out == "shot.png" and any(ch in pos[0] for ch in (".png", ".jpg", "\\", "/")):
             out = pos[0]
-        shot(out, window, region=region)
+        shot(out, window, region=region, bg=bg)
         if do_ocr:
             print("  --- ocr ---")
             blob = region_text(region, image=out) if region else "".join(
@@ -2622,7 +2695,7 @@ def main(argv):
         emit_result("success", True, window=needle, count=len(lines), lines=lines)
 
     elif cmd == "see":
-        needle, out, region, i = None, None, None, 0
+        needle, out, region, bg, i = None, None, None, False, 0
         while i < len(argv):
             if argv[i] == "--window" and i + 1 < len(argv):
                 needle = argv[i + 1]; i += 2
@@ -2630,9 +2703,11 @@ def main(argv):
                 out = argv[i + 1]; i += 2
             elif argv[i] == "--region" and i + 1 < len(argv):
                 region = [int(float(v)) for v in argv[i + 1].split(",")]; i += 2
+            elif argv[i] == "--bg":
+                bg = True; i += 1
             else:
                 i += 1
-        info = see_window(needle=needle, out=out, region=region)
+        info = see_window(needle=needle, out=out, region=region, bg=bg)
         if info["source"] == "ocr":
             print(info["text"])
         emit_result("success", True, source=info["source"], window=needle,
@@ -2961,13 +3036,13 @@ def uia_text(needle, max_lines=400):
     return hwnd, lines
 
 
-def see_window(needle=None, out=None, region=None, min_uia_lines=12, max_lines=400):
+def see_window(needle=None, out=None, region=None, bg=False, min_uia_lines=12, max_lines=400):
     """Screenshot + text: UIA first when a window is named, OCR as fallback.
 
     截图始终拍 —— 文字可以来自 UIA，但"当时屏幕长什么样"只有图能作证。
     """
     path = out or _tmp("see", ".png")
-    shot(path, window=needle, region=region)
+    shot(path, window=needle, region=region, bg=bg)
     print(f"  saved {path}")
     source, lines, uia_err = "ocr", [], None
 

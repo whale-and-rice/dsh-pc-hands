@@ -489,11 +489,14 @@ function applyInner(ctx, config) {
       'window 传窗口标题的子串就只截那个窗口；不传截整个屏幕。' +
       '给了窗口时会先用 UIA 读控件文字（精确、中文不会拆字），读不到才退回 OCR；' +
       '返回里的 source 会说明这次用的是 uia 还是 ocr。' +
+      'background=true 时**不抢焦点**，让窗口自己重绘到内存（PrintWindow）再截——' +
+      '窗口被别的窗口压住、或一半在屏幕外时用这个；代价是个别 Electron 会给旧帧。' +
       '注意：UIA 读出来是控件树（按钮/列表项都带 [Button] 这类标签），OCR 则会把中文拆开、偶有错字。',
     parameters: {
       window: { type: 'string', description: '窗口标题子串（可选）' },
       name: { type: 'string', description: '截图文件名的前缀（可选，默认 see）' },
       region: { type: 'string', description: '只截这一块 x0,y0,x1,y1（可选）。小区域会先放大 2 倍再识别，字反而更准、也快得多' },
+      background: { type: 'boolean', description: '不抢焦点地截那个窗口（PrintWindow）：窗口被挡住/半在屏幕外时用（可选，默认 false）' },
     },
     output: { schema: { type: 'json' }, render: (_a, v) => [{ type: 'text', text: v.text || v.error || '' }] },
     async execute(args) {
@@ -504,6 +507,7 @@ function applyInner(ctx, config) {
       if (args.window) {
         const seeArgs = ['see', '--out', out, '--window', String(args.window)]
         if (args.region) seeArgs.push('--region', String(args.region))
+        if (args.background) seeArgs.push('--bg')
         const res = await py('pc.py', seeArgs)
         const parsed = parseResult(res.out)
         const lines = parsed.lines || []

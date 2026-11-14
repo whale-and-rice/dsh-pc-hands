@@ -71,7 +71,7 @@ pc-doctor
 | 分类 | 工具 | 说明 |
 |---|---|---|
 | 看 | `pc_windows` | 列出可见窗口（句柄/进程/位置/标题） |
-| | `pc_see` | 截屏 + OCR，返回文本与截图路径 |
+| | `pc_see` | 截屏 + OCR，返回文本与截图路径；`background=true` 时**不抢焦点**，用 PrintWindow 让窗口自己重绘（窗口被挡住也能读） |
 | | `pc_find` | 按文字找坐标（支持 `region` / `below` / `above` / `pick`） |
 | 等 | `pc_wait` | 等某段文字出现（OCR 轮询），替代 sleep |
 | | `pc_wait_stable` | 等界面稳定（屏幕截图 + 窗口自绘两路比对），动画/闪烁不会永远判「没稳」 |
@@ -102,6 +102,15 @@ pc-doctor
 - `pc_type` 支持 `secret`：密码/令牌粘完立刻清空剪贴板
 - `pc_doctor` 在缩放不等于 100% 时直接给 WARN（那种机器上点偏最常见）
 - 文字匹配统一**不区分大小写**（`Generate new token` == `Generate New Token`）
+
+### 2026-11-14 未发布：`background` 截图 + 空白告警
+
+- **`pc_see(background=true)`**：走 `PrintWindow(PW_RENDERFULLCONTENT)`，**不抢焦点**截图。
+  窗口被别的窗口压住、或一半在屏幕外时照样拿到完整内容；以前 `window=` 一律先把窗口
+  提到前台再按屏幕坐标抓，被挡住的窗口永远读不到。
+- **空白图会告警**：灰度标准差 < 3.0 时明确打印 WARNING（"通常不是窗口里没内容，而是没截到"），
+  免得把"截不到"读成"界面是空的"然后去点不存在的控件。
+- 顺带修了个真 bug：`shot(window="标题")` 以前只认数字 hwnd，传标题会**静默退化成全屏截图**。
 
 ### v0.10.0 新增
 

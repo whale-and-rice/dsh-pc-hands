@@ -1143,7 +1143,7 @@ function applyInner(ctx, config) {
 
   // 这份 marker 是「DSH 到底收下了哪几个工具」的唯一现场证据：
   // 只记数量不够（旧 marker 只能看出 19 个），记下名字才能发现「掉了一个、补了一个」这种替换。
-  mark('tools-registered', { count: registered, expected: 19, names: registeredNames, failures })
+  mark('tools-registered', { count: registered, expected: 21, names: registeredNames, failures })
   console.log('[pc-hands] 工具就绪 ' + registered + ' 个: ' + registeredNames.join(' / '))
 }
 

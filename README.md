@@ -103,7 +103,7 @@ pc-doctor
 - `pc_doctor` 在缩放不等于 100% 时直接给 WARN（那种机器上点偏最常见）
 - 文字匹配统一**不区分大小写**（`Generate new token` == `Generate New Token`）
 
-### 2026-11-14 未发布：`background` 截图 + 空白告警
+### v0.10.1（2026-11-14）：`background` 截图 + 空白告警
 
 - **`pc_see(background=true)`**：走 `PrintWindow(PW_RENDERFULLCONTENT)`，**不抢焦点**截图。
   窗口被别的窗口压住、或一半在屏幕外时照样拿到完整内容；以前 `window=` 一律先把窗口

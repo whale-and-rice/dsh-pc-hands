@@ -1,51 +1,51 @@
 {
-    "name":  "dsh-pc-hands",
-    "version":  "0.10.0",
-    "description":  "给 AI agent 一双手和一双眼睛：截屏 OCR / 按文字点 / 精细滚动 / 等文字出现 / 等界面稳定 / 急停 / 键鼠剪贴板 / 多步任务（Windows，DSH 插件，21 个工具）",
-    "type":  "module",
-    "main":  "index.js",
-    "license":  "MIT",
-    "files":  [
-                  "index.js",
-                  "cordis.patch.yml",
-                  "README.md",
-                  "LICENSE",
-                  "pc/"
-              ],
-    "keywords":  [
-                     "rapidocr",
-                     "dsh-plugin",
-                     "dsh-pc-hands",
-                     "computer-use",
-                     "ocr",
-                     "uia",
-                     "windows",
-                     "gui-automation"
-                 ],
-    "engines":  {
-                    "node":  "\u003e=22"
-                },
-    "scripts":  {
-                    "test":  "node --test test/*.test.mjs"
-                },
-    "peerDependencies":  {
-                             "@deepseek-ai/dsh-tools":  "*"
-                         },
-    "dsh":  {
-                "bundle":  {
-                               "patch":  "./cordis.patch.yml"
-                           }
-            },
-    "author":  "whale-and-rice",
-    "repository":  {
-                       "type":  "git",
-                       "url":  "https://github.com/whale-and-rice/dsh-pc-hands.git"
-                   },
-    "bugs":  {
-                 "url":  "https://github.com/whale-and-rice/dsh-pc-hands/issues"
-             },
-    "homepage":  "https://github.com/whale-and-rice/dsh-pc-hands",
-    "os":  [
-               "win32"
-           ]
+  "name": "dsh-pc-hands",
+  "version": "0.10.1",
+  "description": "给 AI agent 一双手和一双眼睛：截屏 OCR / 按文字点 / 精细滚动 / 等文字出现 / 等界面稳定 / 急停 / 键鼠剪贴板 / 多步任务（Windows，DSH 插件，21 个工具）",
+  "type": "module",
+  "main": "index.js",
+  "license": "MIT",
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE",
+    "pc/"
+  ],
+  "keywords": [
+    "rapidocr",
+    "dsh-plugin",
+    "dsh-pc-hands",
+    "computer-use",
+    "ocr",
+    "uia",
+    "windows",
+    "gui-automation"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "*"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "author": "whale-and-rice",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/whale-and-rice/dsh-pc-hands.git"
+  },
+  "bugs": {
+    "url": "https://github.com/whale-and-rice/dsh-pc-hands/issues"
+  },
+  "homepage": "https://github.com/whale-and-rice/dsh-pc-hands",
+  "os": [
+    "win32"
+  ]
 }

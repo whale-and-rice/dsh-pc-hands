@@ -31,8 +31,8 @@ import time
 # 被插件当子进程调用时，stdout 会退回系统默认（GBK），中文变乱码、遇到
 # U+200B 之类的字符还会直接抛 UnicodeEncodeError。这里强制成 UTF-8。
 try:
-    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
-    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace', line_buffering=True)
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace', line_buffering=True)
 except Exception:
     pass
 from ctypes import wintypes
@@ -194,6 +194,196 @@ def move(x, y):
     print(f"  pointer -> {int(x)},{int(y)}")
 
 
+# ---------------------------------------------------------------------------
+# 急停：一个旗标文件，任何会循环或连发的动作都看它一眼
+# 2026-11-11 加。为什么不是"杀进程"：一个 pc_task 可能带十几步，杀外层进程
+# 清不干净 Python 子进程正在跑的循环；旗标能让它在下一步之前自己停。
+# ---------------------------------------------------------------------------
+CANCEL_FLAG = os.path.join(tempfile.gettempdir(), "dsh-pc-cancel.flag")
+CANCEL_HIT = {"hit": False}       # 本次调用里是否真的被急停打断过
+
+# 最近一次 type 的结果状态，给 CLI 输出机器可读结果用
+LAST_TYPE = {"status": "unknown"}
+
+RESULT_MARK = "##RESULT##"
+
+# ---------------------------------------------------------------------------
+# 临时文件唯一化（2026-11-11）
+# 以前固定叫 dsh-ocr-crop.png / _pc_wait.png 这种。两个动作叠在一起时，
+# 后一个会把前一个截的图覆盖掉 —— 等于拿别人的图做判断，是实打实的误判。
+# 现在每个临时文件都带 pid + 自增序号 + 时间戳。
+# ---------------------------------------------------------------------------
+_TMP_SEQ = {"n": 0}
+_TMP_FILES = set()
+_TMP_SWEPT = {"done": False}
+_TMP_MAX_AGE = 6 * 3600      # 超过 6 小时的残留才清，别动别人正在用的
+
+
+def _sweep_stale_tmp():
+    """开机首次用临时文件时扫一遍：只清「dsh- 前缀 + 超龄」的残留。
+
+    绝不在这里泛删 %TEMP% 里的 *.png —— 那是共享目录，别人的文件不能动。
+    """
+    if _TMP_SWEPT["done"]:
+        return
+    _TMP_SWEPT["done"] = True
+    try:
+        base = tempfile.gettempdir()
+        now = time.time()
+        removed = 0
+        for name in os.listdir(base):
+            if not name.startswith("dsh-"):
+                continue
+            path = os.path.join(base, name)
+            try:
+                if os.path.isfile(path) and now - os.path.getmtime(path) > _TMP_MAX_AGE:
+                    os.remove(path)
+                    removed += 1
+            except OSError:
+                pass
+        if removed:
+            print("  tmp: 清掉 %d 个超龄残留（>6h，只动 dsh- 前缀）" % removed)
+    except OSError:
+        pass
+
+
+def _cleanup_tmp():
+    """进程退出时删掉自己这次创建的所有临时文件。"""
+    for path in list(_TMP_FILES):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    _TMP_FILES.clear()
+
+
+import atexit as _atexit
+_atexit.register(_cleanup_tmp)
+
+
+def _tmp(name, suffix=""):
+    _sweep_stale_tmp()
+    _TMP_SEQ["n"] += 1
+    stamp = "%d-%d-%d" % (os.getpid(), _TMP_SEQ["n"], int(time.time() * 1000) % 100000)
+    path = os.path.join(tempfile.gettempdir(), "dsh-%s-%s%s" % (name, stamp, suffix))
+    _TMP_FILES.add(path)
+    return path
+
+
+_OCR_ENGINE_TAG = {"v": None}
+
+
+def _ocr_engine_tag():
+    """缓存键必须带上"拿什么引擎识别的"：引擎换了，同图结果可能不同。"""
+    if _OCR_ENGINE_TAG["v"] is not None:
+        return _OCR_ENGINE_TAG["v"]
+    tag = "win"
+    try:
+        rapid = _load_rapid()
+        if rapid.available():
+            ver = getattr(rapid, "VERSION", "") or getattr(rapid, "__version__", "") or "unknown"
+            tag = "rapid:%s" % ver
+    except Exception:
+        tag = "win"
+    _OCR_ENGINE_TAG["v"] = tag
+    return tag
+
+
+# ---------------------------------------------------------------------------
+# OCR 结果缓存（2026-11-11）
+# 键是【图片内容的 sha256】：像素完全一样，识别结果必然一样，跳过重复识别不会
+# 改变任何判断。绝对不按"区域+时间"做键 —— 那种会读到旧帧、把没有的字说成有。
+# 命中时返回深拷贝：_ocr_region 会就地改词框坐标，缓存里必须是原样。
+# 急停：环境变量 DSH_OCR_CACHE=0 可以整段关掉。
+# ---------------------------------------------------------------------------
+_OCR_CACHE = {}
+_OCR_CACHE_MAX = 32
+
+
+def _ocr_cache_on():
+    return os.environ.get("DSH_OCR_CACHE", "1") != "0"
+
+
+def _image_key(path):
+    try:
+        import hashlib
+        with open(path, "rb") as f:
+            raw = f.read()
+        h = hashlib.sha256()
+        h.update(_ocr_engine_tag().encode("utf-8"))
+        h.update(raw)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
+def _crop_key(im):
+    """按图像像素做缓存键：像素一样，识别结果必然一样。"""
+    try:
+        import hashlib
+        h = hashlib.sha256()
+        h.update(_ocr_engine_tag().encode("utf-8"))
+        h.update(("%dx%dx%s" % (im.width, im.height, im.mode)).encode("ascii"))
+        h.update(im.tobytes())
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
+def _deep_copy(data):
+    try:
+        return _json.loads(_json.dumps(data, ensure_ascii=False))
+    except Exception:
+        return data
+
+
+
+def emit_result(status, ok=None, **fields):
+    """统一的机器可读结果：单行 JSON，前缀 ##RESULT##。
+
+    为什么要它：以前插件靠正则猜输出，于是"OCR 跑挂了""超时了""真的没找到"
+    在插件眼里全是"没找到"。status 词表固定，ok 三态必须分得开：
+      ok=True   做成了
+      ok=False  失败了（not_found / timeout / cancelled / error）
+      ok=None   不知道（unverified）—— 既不是成功也不是失败
+    """
+    payload = {"status": status, "ok": ok}
+    payload.update(fields)
+    try:
+        print(RESULT_MARK + " " + _json.dumps(payload, ensure_ascii=False))
+    except Exception:
+        pass
+
+
+def cancel_requested():
+    return os.path.exists(CANCEL_FLAG)
+
+
+def set_cancel(on=True):
+    """写/清急停旗标。返回 True 表示当前状态符合期望。"""
+    try:
+        if on:
+            with open(CANCEL_FLAG, "w", encoding="utf-8") as f:
+                f.write(time.strftime("%Y-%m-%d %H:%M:%S"))
+            return True
+        if os.path.exists(CANCEL_FLAG):
+            os.remove(CANCEL_FLAG)
+        return True
+    except OSError as exc:
+        print(f"  cancel flag error: {exc}")
+        return False
+
+
+def _abort_if_cancelled(where=""):
+    """动作开始前/循环每一轮调用。返回 True 表示已收到急停，调用方应停止。"""
+    if cancel_requested():
+        CANCEL_HIT["hit"] = True
+        tail = f"（{where}）" if where else ""
+        print(f"  CANCELLED: 收到急停{tail}，后续动作不再执行")
+        return True
+    return False
+
+
 def click(x, y, double=False, right=False, hold_ms=55, steps=4, activate_first=False,
           auto_front=True):
     """A click that actually looks like a human one.
@@ -210,6 +400,13 @@ def click(x, y, double=False, right=False, hold_ms=55, steps=4, activate_first=F
     So: bring the target forward (what a real click does anyway), walk the
     pointer in small steps, and hold the button briefly.
     """
+    # 2026-11-11：CLI 传进来的坐标是字符串。以前轨迹那段因为取起点失败被整段跳过，
+    # 所以 x - sx 这个减法从没执行过；轨迹修好之后它立刻炸了（字符串减整数）。
+    # 坐标在入口统一转数字，别再依赖调用方。
+    x = float(x)
+    y = float(y)
+    if _abort_if_cancelled("click"):
+        return False
     if activate_first:
         try:
             activate(str(int(activate_first)))
@@ -227,16 +424,20 @@ def click(x, y, double=False, right=False, hold_ms=55, steps=4, activate_first=F
         except Exception:
             pass
     # walk in, so the target sees real mouse moves
-    try:
-        sx, sy = user32.GetCursorPos(ctypes.byref(ctypes.wintypes.POINT())) or (None, None)
-    except Exception:
-        sx, sy = None, None
-    if sx is None:
+    # 2026-11-11：原来写的是
+    #     sx, sy = user32.GetCursorPos(byref(POINT())) or (None, None)
+    # GetCursorPos 返回的是 BOOL（成功=1），把它当坐标元组解包必然抛异常，
+    # 异常被吞掉后 steps 被改成 1 —— 于是"慢慢划过去"永远退化成瞬移。
+    # 菜单、Qt 控件、悬停面板都靠中间移动事件才会亮起，所以这不是观感问题。
+    start = _cursor_pos()
+    if start is None:
         steps = 1
+        sx, sy = int(x), int(y)
     else:
-        for i in range(1, max(1, steps) + 1):
-            user32.SetCursorPos(int(sx + (x - sx) * i / steps), int(sy + (y - sy) * i / steps))
-            time.sleep(0.015)
+        sx, sy = start
+    for i in range(1, max(1, steps) + 1):
+        user32.SetCursorPos(int(sx + (x - sx) * i / steps), int(sy + (y - sy) * i / steps))
+        time.sleep(0.015)
     user32.SetCursorPos(int(x), int(y))
     time.sleep(0.06)
     down, up = ("right_down", "right_up") if right else ("left_down", "left_up")
@@ -267,6 +468,37 @@ def _proc_name(pid):
         return "?"
     finally:
         kernel32.CloseHandle(h)
+
+
+def _wait_until(pred, timeout=1.0, interval=0.05, what=""):
+    """轮询到 pred() 为真为止，返回 True；超时返回 False。
+
+    为什么要它：很多地方原来是 `time.sleep(0.x)` 固定等一个"应该已经好了"的状态。
+    等够是常态，等不够就偶发失败，等太久就是白等。改成"条件满足就走、满足不了才吃满超时"。
+    """
+    deadline = time.time() + timeout
+    while True:
+        try:
+            if pred():
+                return True
+        except Exception:
+            pass
+        if time.time() >= deadline:
+            return False
+        time.sleep(interval)
+
+
+def _rect_xy(hwnd):
+    """只读窗口左上角，给轮询谓词用。
+
+    不能用 _window_info 当谓词：它连 exe 名一起查，轮询里反复调很浪费；
+    另外它的 rect 是 tuple，跟 list 比较永远不相等 —— 这个坑本轮踩过，
+    谓词恒为 False，固定 sleep 变成了"必定等到超时"，反而更慢。
+    """
+    from ctypes import wintypes
+    r = wintypes.RECT()
+    user32.GetWindowRect(hwnd, ctypes.byref(r))
+    return (int(r.left), int(r.top))
 
 
 def _window_info(hwnd):
@@ -490,7 +722,9 @@ def movewin(needle, x=None, y=None):
     ty = info["rect"][1] if y is None else int(y)
     SWP_NOZORDER, SWP_NOACTIVATE = 0x0004, 0x0010
     user32.SetWindowPos(hwnd, None, tx, ty, w, h, SWP_NOZORDER | SWP_NOACTIVATE)
-    time.sleep(0.25)
+    # 原来是固定 sleep(0.25)：位置通常几毫秒就到位了，白等。改成等它真到。
+    _wait_until(lambda: _rect_xy(hwnd) == (tx, ty),
+                timeout=0.6, interval=0.02, what="movewin")
     now = _window_info(hwnd)
     print(f"  movewin {needle!r}: ({info['rect'][0]},{info['rect'][1]}) -> "
           f"({now['rect'][0]},{now['rect'][1]})  size {now['rect'][2]}x{now['rect'][3]}")
@@ -511,7 +745,9 @@ def dragwin(needle, x2, y2, hold_ms=600, steps=40, gap_ms=15, grab=None):
     else:
         dx, dy = ww // 2, int(wh * 0.72)
     drag(wx + dx, wy + dy, int(x2), int(y2), steps=steps, hold_ms=hold_ms, gap_ms=gap_ms)
-    time.sleep(0.3)
+    # 原来是固定 sleep(0.3)：改成等窗口位置真的动了（拖不动的情况也能早发现）
+    _wait_until(lambda: _rect_xy(hwnd) != (wx, wy),
+                timeout=0.8, interval=0.02, what="dragwin")
     now = _window_info(hwnd)
     print(f"  dragwin {needle!r}: now at ({now['rect'][0]},{now['rect'][1]}) "
           f"size {now['rect'][2]}x{now['rect'][3]}")
@@ -535,7 +771,7 @@ def wintext(hwnd, find=""):
     if w < 20 or h < 20:
         print(f"  wintext: window too small ({w}x{h})")
         return None
-    shot_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_win.png")
+    shot_path = _tmp("win", ".png")
     _grab_window_safe(int(hwnd), shot_path)
     data = ocr_best(shot_path)
     lines = data.get("lines", [])
@@ -636,7 +872,7 @@ def watch(hwnd, until, timeout=60.0, interval=0.6, click_hit=False):
         info = _window_info(int(hwnd))
         x, y, w, h = info["rect"]
         if w >= 20 and h >= 20:
-            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_watch.png")
+            path = _tmp("watch", ".png")
             _grab_window_safe(int(hwnd), path)
             data = ocr_best(path)
             flat = "".join("".join(wd["t"].split()) for wd in data.get("words", []))
@@ -766,6 +1002,8 @@ def hscroll(n):
     """
     step = 120
     for _ in range(abs(int(n))):
+        if _abort_if_cancelled("hscroll"):
+            return False
         _mouse(MOUSEEVENTF["hwheel"], data=step if int(n) > 0 else -step)
         time.sleep(0.04)
     print(f"  hscrolled {n}")
@@ -924,18 +1162,24 @@ def menu(menu_title, item, expect=None, pid=None, tries=3, hold_ms=95):
             continue
         before = set(_titled_windows(pid))
         _jump_click(it[0], it[1], hold_ms)
-        time.sleep(2.2 if expect else 0.8)
 
         if expect:
-            for _ in range(12):
-                now = set(_titled_windows(pid)) - before
-                hit = [w for w in now if expect in w]
+            # 原来先固定等 2.2 秒再轮询：窗口一般 0.3 秒就出来了，白等近两秒。
+            # 现在直接等「新窗口出现」，出现就立刻返回。
+            deadline = time.time() + 3.0
+            hit = []
+            while True:
+                hit = [w for w in (set(_titled_windows(pid)) - before) if expect in w]
                 if hit:
                     print(f"  menu: {menu_title} -> {item} 生效，弹出「{hit[0]}」")
                     return True
-                time.sleep(0.4)
+                if time.time() >= deadline:
+                    break
+                time.sleep(0.15)
             print(f"  menu: 第 {attempt} 次点了「{item}」但没等到「{expect}」")
         else:
+            # 没有可等的目标，只留一点让菜单收起来的物理间隔
+            time.sleep(0.12)
             print(f"  menu: {menu_title} -> {item} 已点击")
             return True
     return False
@@ -1054,10 +1298,33 @@ def clickcheck(x, y, region=None, tries=3):
 
 
 def scroll(n):
+    """按「格」滚：n 格，一格 120 个滚轮增量。负数是向下。"""
     step = 120
     for _ in range(abs(int(n))):
+        if _abort_if_cancelled("scroll"):
+            return False
         _mouse(MOUSEEVENTF["wheel"], data=step if int(n) > 0 else -step)
     print(f"  scrolled {n}")
+
+
+def scroll_delta(delta):
+    """按「滚轮增量」滚：120 = 一格，负数向下。
+
+    2026-11-11 修的坑：插件把「一格 120」的 `amount` 原样当格数传进 scroll()，
+    于是 amount=-1200 变成了 1200 格 × 120 = 144000 增量，多滚 100 倍。
+    现在分成两个入口，各管各的语义，谁也别猜谁。
+    """
+    d = int(delta)
+    if d == 0:
+        print("  scrolled 0")
+        return
+    step = 120 if d > 0 else -120
+    notches = max(1, int(round(abs(d) / 120.0)))
+    for _ in range(notches):
+        if _abort_if_cancelled("scroll_delta"):
+            return False
+        _mouse(MOUSEEVENTF["wheel"], data=step)
+    print(f"  scrolled delta {d} ({notches} notch)")
 
 
 def _set_clipboard(text: str) -> None:
@@ -1253,34 +1520,224 @@ def clip_get_str():
 
 # =======================================================================
 
-def type_text(text, expect=None):
-    """剪贴板粘贴（中文唯一可靠路径）。P0：备份剪贴板 → 粘贴 → 校验 → 复原。"""
+def _read_focus_text_via_copy(hwnd):
+    """把焦点里的文字真正读回来：Ctrl+A → Ctrl+C → 读剪贴板。
+
+    这是**最通用**的验证手段：不依赖 UIA（Electron 不暴露）、不依赖 OCR（中文
+    会读错字），只要那个输入框支持全选复制就行——记事本、浏览器、Electron、
+    WPS 都支持。代价是会动一下选区，所以读完把光标按 End 收回到末尾。
+    返回 (ok, text)：ok=False 表示剪贴板里没拿到东西（比如焦点不在文本框里）。
+    """
+    bak = clip_get_str()
+    got = ""
+    try:
+        _set_clipboard("")          # 先清空：否则“什么都没复制”会读到上一次的内容
+        time.sleep(0.05)
+        _key(VK["ctrl"]); _key(VK["a"]); _key(VK["a"], up=True); _key(VK["ctrl"], up=True)
+        time.sleep(0.12)
+        _key(VK["ctrl"]); _key(VK["c"]); _key(VK["c"], up=True); _key(VK["ctrl"], up=True)
+        time.sleep(0.30)
+        got = clip_get_str() or ""
+    finally:
+        try:                          # 全选状态收回到末尾（不影响内容，只是别留个选区）
+            _key(VK["end"]); _key(VK["end"], up=True)
+        except Exception:
+            pass
+        try:
+            _set_clipboard(bak if bak else "")
+        except Exception:
+            pass
+    return bool(got.strip()), got
+
+
+def _plain_text(s):
+    """去掉空白和标点，只留字——OCR、剪贴板、输入文本三边比较时都用这个。"""
+    import re as _re
+    return _re.sub(r"[^\w\u4e00-\u9fff]+", "", s or "")
+
+
+def _grab_for_compare(hwnd, tag):
+    """给打字前后取两张图，用来做像素差分。"""
+    import tempfile
+    tmp = _tmp("type-" + str(tag), ".png")
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+    for grab in (_grab_screen, _grab_window):
+        try:
+            grab(hwnd, tmp)
+            if os.path.exists(tmp) and os.path.getsize(tmp) > 1024:
+                return tmp
+        except Exception:
+            continue
+    return None
+
+
+def _pixels_changed(p1, p2):
+    """两张图差多少（0~1）。用来回答“这次粘贴到底有没有在屏幕上留下痕迹”。
+
+    OCR 读中文会错字（把「-」读成「一」、「2026」读成「202」），所以不能拿
+    OCR 当唯一证据；像素差分对语言无感，只回答“变了没有”。
+    """
+    if not p1 or not p2:
+        return None
+    try:
+        from PIL import Image, ImageChops
+        a = Image.open(p1).convert("L")
+        b = Image.open(p2).convert("L")
+        if a.size != b.size:
+            return 1.0
+        diff = ImageChops.difference(a, b)
+        hist = diff.histogram()
+        total = a.size[0] * a.size[1]
+        changed = sum(hist[8:])
+        return changed / float(total)
+    except Exception:
+        return None
+
+
+def _window_text_has(needle, hwnd):
+    """打字自校验：把窗口截下来 OCR，看这段字到底进没进去。
+
+    返回 True（找到了）/ False（图里能认字，但没有这段）/ None（验不了）。
+
+    2026-11-11 第一次写这版时踩了坑：PrintWindow 抓 Tk/Electron 窗口拿到
+    空白图，OCR 一个字都认不出，于是被判成“没进去”——**截图失败冒充了证据**。
+    所以现在：先按屏幕坐标抓（前台窗口所见即所得），抓不到再用 PrintWindow；
+    而且只要 OCR 认出的字少于 3 个，一律返回 None（不知道），绝不返回 False。
+    """
+    import tempfile
+    tmp = _tmp("type-verify", ".png")
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+    got = False
+    for grab in (_grab_screen, _grab_window):
+        try:
+            grab(hwnd, tmp)
+            if os.path.exists(tmp) and os.path.getsize(tmp) > 1024:
+                got = True
+                break
+        except Exception:
+            got = False
+    if not got:
+        return None
+    try:
+        data = ocr(tmp)
+    except SystemExit:
+        return None
+    words = len(data.get("words", []) or [])
+    if words < 3:
+        return None                     # 图是空的/花的，没资格当证据
+    # 两边都去掉空白和标点再比：OCR 会把「测试-2026」的连字符读出来，
+    # 而调用方传进来的 probe 已经去了标点，不去标点就永远比不中（2026-11-11 踩的坑）。
+    import re as _re
+    def _plain(s):
+        return _re.sub(r"[^\w\u4e00-\u9fff]+", "", s or "")
+    flat = _plain("".join(w["t"] for w in data.get("words", [])))
+    target = _plain(needle)
+    if not target:
+        return None
+    return target in flat
+
+
+def type_text(text, expect=None, verify=False, retries=0, secret=False):
+    """剪贴板粘贴（中文唯一可靠路径）。
+
+    2026-11-11 改（Kimi 窗口打不进字那次）：粘贴之后**自己验一遍**。
+    以前只报 "typed N chars"，字掉进虚空也照样说成功 —— 那是最坏的失败方式。
+    现在 verify=True 时截窗口做 OCR，三种结果分开报：verified / NOT_CONFIRMED /
+    UNVERIFIED（验不了 ≠ 失败）。
+    默认**不重试**：第一次写这版时重试导致同一个窗被输入三遍，重复比漏输更糟。
+    剪贴板复原也挪到校验之后 —— Electron 的粘贴是异步的，0.15 秒就复原会让它粘到空。
+    """
+    if _abort_if_cancelled("type"):
+        LAST_TYPE["status"] = "cancelled"
+        return False
     before = _fingerprint()
     if not focus_guard(expect, quiet=True):
         print("  abort: 焦点不在目标窗口，拒绝粘贴（避免把内容粘进别处）")
+        LAST_TYPE["status"] = "error"
         return False
     bak = clip_get_str()
-    _set_clipboard(text)
-    time.sleep(0.12)
-    if (clip_get_str() or "") != text:
+    hwnd = before.get("hwnd")
+    probe = "".join(text.split())[:12] or text[:12]
+    shot_before = _grab_for_compare(hwnd, "before") if (verify and hwnd) else None
+
+    def _paste_once():
         _set_clipboard(text)
-        time.sleep(0.10)
-    _key(VK["ctrl"]); _key(VK["v"]); _key(VK["v"], up=True); _key(VK["ctrl"], up=True)
-    time.sleep(0.15)
+        time.sleep(0.12)
+        if (clip_get_str() or "") != text:
+            _set_clipboard(text)
+            time.sleep(0.10)
+        _key(VK["ctrl"]); _key(VK["v"]); _key(VK["v"], up=True); _key(VK["ctrl"], up=True)
+        time.sleep(0.45)
+
+    _paste_once()
     after = _fingerprint()
     same = after.get("hwnd") == before.get("hwnd")
-    # 复原剪贴板（原来是空就清空，绝不留代码在剪贴板里）
+
+    verified, ver_src = None, ""
+    if verify and hwnd and not secret:
+        # ① 最通用也最准：Ctrl+A/Ctrl+C 把焦点里的字复制回来比。
+        #    不依赖 UIA（Electron 不暴露）、不依赖 OCR（中文会读错字），
+        #    记事本/浏览器/Electron/WPS 都吃这一套。
+        ok_copy, got = _read_focus_text_via_copy(hwnd)
+        if ok_copy:
+            # 2026-11-11 改：以前只比前 20 个归一化字，第 21 个字被截也照样算过，
+            # 却还宣称"内容就是刚打的字"。现在整段都必须在框里（可含原有前缀）。
+            want = _plain_text(text)
+            have = _plain_text(got)
+            verified = bool(want) and want in have
+            ver_src = "copy"
+            if verified:
+                print("  读回确认：整段文字都在输入框里")
+            else:
+                miss = 0
+                while miss < len(want) and (want[:len(want) - miss] not in have):
+                    miss += 1
+                print(f"  读回比对不一致（框里现在 {len(have)} 字，缺了末尾约 {miss} 字）")
+        # ② 复制读不到（不是文本框/被禁用）→ 退回 OCR，再退回像素
+        if verified is None:
+            for i in range(3):
+                verified = _window_text_has(probe, hwnd)
+                if verified is not False:
+                    ver_src = "ocr"
+                    break
+                time.sleep(0.4)
+        if verified is False and ver_src != "copy":
+            changed = _pixels_changed(shot_before, _grab_for_compare(hwnd, "after"))
+            if changed is not None:
+                if changed >= 0.002:
+                    verified, ver_src = "pixel", "pixel"
+                    print(f"  OCR 没认准（中文 OCR 易错字），但画面变了 {changed:.2%}，判为“像已输入”")
+                else:
+                    print(f"  OCR 没认准，画面也几乎没变（{changed:.4%}）——判为没进去")
+
+    # 复原剪贴板（原来是空就清空，绝不留代码在剪贴板里）——放在校验之后
     try:
         _set_clipboard(bak if bak else "")
     except Exception:
         pass
     _fp("type", before, after,
-        chars=len(text), focus_kept=same, head=text[:40],
-        ok=(same and (after.get("title") or "") == (before.get("title") or "")))
+        chars=len(text), focus_kept=same,
+        # 敏感内容绝不落明文：指纹里只留长度（2026-11-11 之前前 40 字会写进日志）
+        head="" if secret else text[:40], verified=verified)
     if not same:
         print("  WARN: 粘贴期间前台窗口变了，内容可能落到别处")
+        LAST_TYPE["status"] = "error"
         return False
-    print(f"  typed {len(text)} chars (pasted, clipboard restored)")
+    if verified is False:
+        print(f"  TYPE_NOT_CONFIRMED: 窗口里认得出字，但找不到「{probe}」——字没进去（焦点多半不在输入框里）")
+        LAST_TYPE["status"] = "not_confirmed"
+        return False
+    if verify and verified is None:
+        print("  TYPE_UNVERIFIED: 截图是空的或 OCR 认不出字，没法确认（既不是成功也不是失败）")
+    tag = {True: ", verified", "pixel": ", 像已输入（像素变化，字未被 OCR 认准）"}.get(verified, "")
+    print(f"  typed {len(text)} chars (pasted, clipboard restored{tag})")
+    LAST_TYPE["status"] = ("success" if verified in (True, "pixel") else ("unverified" if verify else "success"))
     return True
 
 
@@ -1364,7 +1821,8 @@ def _uia(*args):
     import subprocess
     res = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
                           "-File", UIA, *[str(a) for a in args]],
-                         capture_output=True, text=True, timeout=60)
+                         capture_output=True, text=True, timeout=60,
+                         encoding="utf-8", errors="replace")
     return (res.stdout or "") + (res.stderr or "")
 
 
@@ -1424,8 +1882,33 @@ def ocr(image, find=""):
     """
     import json as _json
     import subprocess
-    import tempfile
-    tmp = os.path.join(tempfile.gettempdir(), "dsh-ocr-result.json")
+    # 2026-11-11：只读一次字节。
+    # 以前是"先哈希文件、再让 ocr.ps1 自己重读一遍" —— 中间文件若被替换，
+    # 就成了「哈希算的是 A、识别的是 B」。现在用同一份字节做哈希和识别。
+    import hashlib
+    raw = None
+    try:
+        with open(image, "rb") as f:
+            raw = f.read()
+    except OSError:
+        raw = None
+    key = None
+    if raw is not None and _ocr_cache_on():
+        h = hashlib.sha256()
+        h.update(_ocr_engine_tag().encode("utf-8"))
+        h.update(raw)
+        key = h.hexdigest()
+    if key and key in _OCR_CACHE:
+        return _deep_copy(_OCR_CACHE[key])
+    if raw is not None:
+        image_copy = _tmp("ocr-src", ".png")
+        try:
+            with open(image_copy, "wb") as f:
+                f.write(raw)
+            image = image_copy
+        except OSError:
+            pass
+    tmp = _tmp("ocr-result", ".json")
     try:
         os.remove(tmp)
     except OSError:
@@ -1436,9 +1919,15 @@ def ocr(image, find=""):
                          errors="replace", timeout=120)
     if os.path.exists(tmp):
         try:
-            return _json.loads(io.open(tmp, encoding="utf-8").read())
+            with io.open(tmp, encoding="utf-8") as fh:
+                data = _json.loads(fh.read())
         except _json.JSONDecodeError as exc:
             raise SystemExit(f"  ocr json broken: {exc}")
+        if key:
+            if len(_OCR_CACHE) >= _OCR_CACHE_MAX:
+                _OCR_CACHE.pop(next(iter(_OCR_CACHE)))
+            _OCR_CACHE[key] = _deep_copy(data)
+        return data
     out = (res.stdout or "").strip()
     start = out.find("{")
     if start < 0:
@@ -1446,12 +1935,20 @@ def ocr(image, find=""):
     return _json.loads(out[start:])
 
 
+_RAPID_MODULE = None
+
+
 def _load_rapid():
+    """每次 importlib.exec_module 都会丢掉模块里的引擎；worker 必须复用它。"""
+    global _RAPID_MODULE
+    if _RAPID_MODULE is not None:
+        return _RAPID_MODULE
     import importlib.util as _iu
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ocr_rapid.py")
     spec = _iu.spec_from_file_location("ocr_rapid", path)
     mod = _iu.module_from_spec(spec)
     spec.loader.exec_module(mod)
+    _RAPID_MODULE = mod
     return mod
 
 
@@ -1483,9 +1980,20 @@ def _ocr_region(image, region, scale=2):
     im = Image.open(image).convert("RGB").crop((x0, y0, x1, y1))
     if scale != 1:
         im = im.resize((im.width * scale, im.height * scale), Image.LANCZOS)
-    tmp = os.path.join(tempfile.gettempdir(), "dsh-ocr-crop.png")
-    im.save(tmp)
-    data = ocr(tmp)
+    # 2026-11-11：按【这块区域自己的像素】做缓存键。
+    # 原来缓存键是整屏，桌面上的时钟和桌宠一直在动，永远命中不了；
+    # 现在只要「要识别的那块」没变就直接复用，和整屏上别处在动无关。
+    key = _crop_key(im) if _ocr_cache_on() else None
+    if key and key in _OCR_CACHE:
+        data = _deep_copy(_OCR_CACHE[key])
+    else:
+        tmp = _tmp("ocr-crop", ".png")
+        im.save(tmp)
+        data = ocr(tmp)
+        if key and data.get("ok"):
+            if len(_OCR_CACHE) >= _OCR_CACHE_MAX:
+                _OCR_CACHE.pop(next(iter(_OCR_CACHE)))
+            _OCR_CACHE[key] = _deep_copy(data)
     if data.get("ok"):
         for wd in data.get("words", []):
             wd["x"] = int(wd["x"] / scale) + x0
@@ -1547,7 +2055,7 @@ def find_text(needle, image=None, region=None, below=None, above=None, pick="fir
     below/above: another phrase used as a boundary anchor.
     """
     if image is None:
-        image = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_ocr_full.png")
+        image = _tmp("ocr-full", ".png")
         shot(image)
     if scale == 0:
         data = _ocr_multi(image, region) if region else ocr_best(image)
@@ -1656,8 +2164,9 @@ def scan_click(needle, verify, scan_region, verify_region, step=22, dwell_ms=700
     while y <= y1:
         click(cx, y)
         time.sleep(dwell_ms / 1000.0)
-        shot(os.path.join(tempfile.gettempdir(), "scan-verify.png"))
-        data = _ocr_region(os.path.join(tempfile.gettempdir(), "scan-verify.png"),
+        _scan_png = _tmp("scan-verify", ".png")
+        shot(_scan_png)
+        data = _ocr_region(_scan_png,
                            verify_region, 2)
         blob = "".join("".join(w["t"].split()) for w in data.get("words", []))
         ok = "".join(verify.split()) in blob
@@ -1729,7 +2238,7 @@ def cmd_changed(args):
 
     if baseline:
         import tempfile
-        cur = os.path.join(tempfile.gettempdir(), "pc-changed-now.png")
+        cur = _tmp("changed-now", ".png")
         shot(cur, window)
         if not os.path.exists(baseline):
             import shutil
@@ -1797,6 +2306,9 @@ def main(argv):
                 do_ocr = True; i += 1
             else:
                 i += 1
+        # 裸路径当 --out 用：以前 `shot D:\x.png` 会静默存成 shot.png，找图时白等一场
+        if pos and out == "shot.png" and any(ch in pos[0] for ch in (".png", ".jpg", "\\", "/")):
+            out = pos[0]
         shot(out, window, region=region)
         if do_ocr:
             print("  --- ocr ---")
@@ -1918,10 +2430,10 @@ def main(argv):
             print("   " + ln)
     elif cmd == "wintext":
         # wintext <hwnd> [--find 文字]
-        find = ""
+        needle = ""
         if "--find" in args:
-            find = args[args.index("--find") + 1]
-        wintext(int(args[0]), find)
+            needle = args[args.index("--find") + 1]
+        wintext(int(args[0]), needle)
     elif cmd == "closewin":
         closewin(args[0])
     elif cmd == "hover":
@@ -1975,6 +2487,8 @@ def main(argv):
     elif cmd == "scroll":
         if "--px" in args:
             scroll_px(int(args[args.index("--px") + 1]))
+        elif "--delta" in args:
+            scroll_delta(int(args[args.index("--delta") + 1]))
         else:
             scroll(pos[0])
     elif cmd == "hscroll":
@@ -2005,6 +2519,28 @@ def main(argv):
             elif a == "--step":
                 st = int(args[i + 1])
         scroll_to(pos[0], timeout=to, region=rg, step=st)
+    elif cmd == "waitstable":
+        # waitstable [--window 标题|hwnd] [--region x0,y0,x1,y1] [--stable 500] [--timeout 8]
+        win, rg, stable_ms, to = None, None, 500.0, 8.0
+        for i, a in enumerate(args):
+            if a == "--window":
+                win = args[i + 1]
+            elif a == "--region":
+                rg = args[i + 1]
+            elif a == "--stable":
+                stable_ms = float(args[i + 1])
+            elif a == "--timeout":
+                to = float(args[i + 1])
+        res = wait_stable(window=win, region=rg, stable_ms=stable_ms, timeout=to)
+        emit_result(
+            "success" if res is True else ("cancelled" if CANCEL_HIT["hit"] else
+                                           ("timeout" if res is False else "unverified")),
+            True if res is True else (False if res is False else None),
+            window=win, region=rg, stable_ms=stable_ms)
+        if res is False:
+            sys.exit(6 if CANCEL_HIT["hit"] else 3)   # 被叫停优先报急停
+        if res is None:
+            sys.exit(6 if CANCEL_HIT["hit"] else 5)
     elif cmd == "waittext":
         rg, to, gone = None, 20.0, False
         for i, a in enumerate(args):
@@ -2016,12 +2552,12 @@ def main(argv):
                 gone = True
         if gone:
             ok = wait_gone(pos[0], timeout=to, region=rg)
-            if not ok:
-                raise SystemExit(3)
         else:
             ok = wait_text(pos[0], timeout=to, region=rg)
-            if not ok:
-                raise SystemExit(3)
+        emit_result("success" if ok else ("cancelled" if CANCEL_HIT["hit"] else "timeout"),
+                    bool(ok), gone=gone, text=pos[0])
+        if not ok:
+            raise SystemExit(3)
     elif cmd == "clicklabel":
         rg = None
         if "--region" in args:
@@ -2031,15 +2567,31 @@ def main(argv):
         clip_get()
     elif cmd == "clipset":
         clip_set(args[0] if args else "")
+    elif cmd == "cancel":
+        # cancel           → 立刻急停（写旗标，正在跑的循环下一步就停）
+        # cancel --clear   → 解除急停
+        if "--clear" in flags or "--off" in flags:
+            ok = set_cancel(False)
+            print("  cancel cleared" if ok else "  cancel clear FAILED")
+        else:
+            ok = set_cancel(True)
+            print("  cancel requested（正在跑的动作会在下一步停下）" if ok else "  cancel FAILED")
+        if not ok:
+            sys.exit(4)
     elif cmd == "doctor":
         doctor()
     elif cmd == "type":
         exp = _expect_of(args)
         if "--secret" in flags:
-            type_secret(pos[0] if pos else "")
+            ok = type_secret(pos[0] if pos else "", expect=exp)
+            emit_result("success" if ok else "error", bool(ok), secret=True)
+            if not ok:
+                sys.exit(4)
         else:
             txt = args[0] if args and not args[0].startswith("--") else ""
-            if not type_text(txt, expect=exp):
+            ok = type_text(txt, expect=exp, verify=("--verify" in flags))
+            emit_result(LAST_TYPE["status"], ok, chars=len(txt))
+            if not ok:
                 sys.exit(4)
     elif cmd == "key":
         if not focus_guard(_expect_of(args), quiet=True):
@@ -2049,6 +2601,44 @@ def main(argv):
         key(pos[0])
         time.sleep(0.08)
         _fp("key", before, _fingerprint(), k=pos[0])
+    elif cmd == "uia_text":
+        needle, limit, i = None, 400, 0
+        while i < len(argv):
+            if argv[i] == "--window" and i + 1 < len(argv):
+                needle = argv[i + 1]; i += 2
+            elif argv[i] == "--max" and i + 1 < len(argv):
+                limit = int(argv[i + 1]); i += 2
+            else:
+                i += 1
+        if not needle:
+            raise SystemExit('  usage: pc.py uia_text --window "标题" [--max 400]')
+        _hwnd, lines = uia_text(needle, max_lines=limit)
+        for line in lines:
+            print(line)
+        if not lines:
+            print("  uia: 这个窗口没暴露可读控件，退回 OCR")
+            emit_result("unverified", None, window=needle, count=0, lines=[])
+            sys.exit(5)
+        emit_result("success", True, window=needle, count=len(lines), lines=lines)
+
+    elif cmd == "see":
+        needle, out, region, i = None, None, None, 0
+        while i < len(argv):
+            if argv[i] == "--window" and i + 1 < len(argv):
+                needle = argv[i + 1]; i += 2
+            elif argv[i] == "--out" and i + 1 < len(argv):
+                out = argv[i + 1]; i += 2
+            elif argv[i] == "--region" and i + 1 < len(argv):
+                region = [int(float(v)) for v in argv[i + 1].split(",")]; i += 2
+            else:
+                i += 1
+        info = see_window(needle=needle, out=out, region=region)
+        if info["source"] == "ocr":
+            print(info["text"])
+        emit_result("success", True, source=info["source"], window=needle,
+                    shot=info["shot"], count=len(info["lines"]),
+                    text=info["text"], lines=info["lines"])
+
     elif cmd == "hotkey":
         if not focus_guard(_expect_of(args), quiet=True):
             print("  abort: focus mismatch, refuse to act")
@@ -2067,14 +2657,14 @@ def main(argv):
         seq(args[0] if args else "")
     elif cmd == "ocr":
         image = None
-        find = ""
+        needle = ""
         for i, a in enumerate(args):
             if a == "--image":
                 image = args[i + 1]
             elif a == "--find":
-                find = args[i + 1]
+                needle = args[i + 1]
         if image is None:
-            image = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_ocr_full.png")
+            image = _tmp("ocr-full", ".png")
             shot(image)
         data = ocr_best(image)
         print(f"  ok={data.get('ok')} engine={data.get('engine', 'windows')} lines={len(data.get('lines', []))}")
@@ -2126,6 +2716,11 @@ def main(argv):
             elif a == "--region":
                 opts["region"] = tuple(int(v) for v in args[i + 1].split(","))
                 i = i + 2
+            elif a == "--window":
+                # 2026-11-11 补：以前 --window 会被当成普通参数塞进 rest 里悄悄丢掉，
+                # 于是"只在某个窗口里找"其实整屏都扫了（又慢又容易撞到别处的同名文字）。
+                opts["window"] = args[i + 1]
+                i = i + 2
             elif a == "--scale":
                 opts["scale"] = int(args[i + 1])
                 i = i + 2
@@ -2133,7 +2728,25 @@ def main(argv):
                 rest.append(a)
                 i = i + 1
         fn = find_text if cmd == "findtext" else click_text
-        fn(rest[0], None, **opts)
+        _win = opts.pop("window", None)
+        if _win:
+            _w = _window_info(_resolve_window(_win))
+            _x, _y, _ww, _wh = _w["rect"]
+            opts["region"] = (_x, _y, _x + _ww, _y + _wh)
+            print(f"  scope: 只在窗口「{_w['title'][:40]}」里找 ({_x},{_y}) {_ww}x{_wh}")
+        try:
+            res = fn(rest[0], None, **opts)
+        except SystemExit as exc:
+            # 引擎层面的问题（OCR 跑不起来、锚点找不到）不能算"没找到"
+            emit_result("error", False, kind="engine", detail=str(exc)[:200])
+            raise
+        if cmd == "findtext":
+            if res:
+                emit_result("success", True, text=rest[0], point=[res[0], res[1]])
+            else:
+                emit_result("not_found", False, text=rest[0])
+        else:
+            emit_result("success" if res else "not_found", bool(res), text=rest[0])
     else:
         raise SystemExit(f"unknown verb: {cmd}")
 
@@ -2328,10 +2941,61 @@ def _norm(s):
     return "".join(str(s).split()).lower()
 
 
+def uia_text(needle, max_lines=400):
+    """Read a window's strings through UI Automation instead of OCR.
+
+    Why: OCR costs ~0.8 s a screen and mangles Chinese; UIA hands back exact
+    strings (measured on the DSH window: 301 lines in 0.55 s). Not every window
+    exposes its tree — Explorer returned 0 lines — so callers keep an OCR fallback.
+    """
+    hwnd = _resolve_window(needle)
+    out = _uia("text", hwnd, "", int(max_lines))
+    lines = []
+    for line in out.splitlines():
+        s = line.rstrip()
+        if not s.strip():
+            continue
+        if s.startswith("TOTAL ") or s.startswith("ERROR "):
+            continue
+        lines.append(s)
+    return hwnd, lines
+
+
+def see_window(needle=None, out=None, region=None, min_uia_lines=12, max_lines=400):
+    """Screenshot + text: UIA first when a window is named, OCR as fallback.
+
+    截图始终拍 —— 文字可以来自 UIA，但"当时屏幕长什么样"只有图能作证。
+    """
+    path = out or _tmp("see", ".png")
+    shot(path, window=needle, region=region)
+    print(f"  saved {path}")
+    source, lines, uia_err = "ocr", [], None
+
+    if needle:
+        try:
+            _h, uia_lines = uia_text(needle, max_lines=max_lines)
+        except SystemExit as exc:
+            uia_lines = []
+            uia_err = str(exc)[:200]
+        if len(uia_lines) >= int(min_uia_lines):
+            source, lines = "uia", uia_lines
+            print(f"  UIA: {len(lines)} 行（跳过 OCR）")
+        elif uia_lines:
+            print(f"  UIA 只给了 {len(uia_lines)} 行，退回 OCR")
+
+    if source == "ocr":
+        data = ocr_best(path) or {}
+        lines = [str(l) for l in (data.get("lines") or []) if str(l).strip()]
+
+    text = "\n".join(lines)
+    return {"source": source, "lines": lines, "text": text,
+            "shot": path, "uia_error": uia_err}
+
+
 def screen_text(region=None):
     """截全屏 → OCR。不打印（轮询里用，打印会把日志刷爆）。"""
     from PIL import ImageGrab
-    tmp = os.path.join(tempfile.gettempdir(), "_pc_wait.png")
+    tmp = _tmp("wait", ".png")
     ImageGrab.grab(all_screens=True).save(tmp)
     data = ocr_best(tmp, region) or {}
     return data.get("lines") or [], data.get("words") or []
@@ -2346,7 +3010,7 @@ def region_text(region, image=None, scale=1):
     If `image` is given it is assumed to be ALREADY cropped to that region
     (i.e. it came from shot(..., region=...)), so it is OCR'd as a whole.
     """
-    p = image or os.path.join(tempfile.gettempdir(), "_region_text.png")
+    p = image or _tmp("region-text", ".png")
     if image is None:
         shot(p, region=region)
     # 小区域里的字太小，OCR 会吞字（实测「外部源文件」被读成「外部源件」）——
@@ -2414,6 +3078,167 @@ def click_verify(x, y, verify, vregion=None, vtimeout=3.0, double=False):
     return True
 
 
+def _hwnd_by_title(title_part):
+    """按标题子串找窗口句柄；多个命中只认第一个，并在日志里说明。"""
+    part = (title_part or "").lower()
+    hits = [r for r in windows() if part in (r[6] or "").lower()]
+    if not hits:
+        print(f"  no window title contains: {title_part}")
+        return None
+    if len(hits) > 1:
+        print(f"  note: {len(hits)} windows match {title_part!r}，用第一个 hwnd={hits[0][0]}")
+    return int(hits[0][0])
+
+
+def _snap_image(window=None, region=None):
+    """截一张图（内存里的 PIL 对象），给「等界面稳定」用。
+
+    window 可以是 hwnd 数字，也可以是标题子串；都没有就截前台窗口。
+    region 优先：给了 region 就只截那一块（少受桌宠、时钟、视频干扰）。
+    """
+    from PIL import ImageGrab
+    try:
+        if region:
+            # region 既可能是 "x0,y0,x1,y1" 字符串，也可能是列表/元组；
+            # 直接 for v in 字符串 会把逗号也当坐标（'0,600,500,1040' → int(',')）。
+            if isinstance(region, str):
+                region = [v for v in region.replace(" ", "").split(",") if v]
+            x0, y0, x1, y1 = [int(float(v)) for v in region]
+            return ImageGrab.grab(bbox=(x0, y0, x1, y1), all_screens=True)
+        hwnd = None
+        if window:
+            s = str(window).strip()
+            if s.isdigit():
+                hwnd = int(s)
+            else:
+                hwnd = _hwnd_by_title(s)
+                if hwnd is None:
+                    # 说好了等某个窗口，却找不到它 —— 绝不能偷偷去截前台窗口，
+                    # 那会把“量错了对象”伪装成“界面稳定了”。
+                    print(f"  UNVERIFIED: 找不到窗口 {window!r}，不拿别的窗口顶替")
+                    return None
+        if hwnd is None:
+            hwnd = int(user32.GetForegroundWindow())
+        x, y, w, h = _window_info(hwnd)["rect"]
+        if w < 8 or h < 8:
+            return None
+        return ImageGrab.grab(bbox=(x, y, x + w, y + h), all_screens=True)
+    except Exception:
+        return None
+
+
+def _image_diff_ratio(a, b):
+    """两张图的差异比例（0~1）。对语言无感，只回答“画面动了多少”。"""
+    if a is None or b is None:
+        return None
+    try:
+        from PIL import ImageChops
+        ga, gb = a.convert("L"), b.convert("L")
+        if ga.size != gb.size:
+            return 1.0
+        diff = ImageChops.difference(ga, gb)
+        hist = diff.histogram()
+        total = ga.size[0] * ga.size[1]
+        return sum(hist[8:]) / float(total)
+    except Exception:
+        return None
+
+
+def _snap_window_only(hwnd):
+    """只截窗口自己的内容（PrintWindow），不含压在它上面的桌宠/弹窗。
+
+    屏幕截图会被别的窗口污染：桌宠是动画的，量“这个窗口稳不稳”会被它带偏。
+    PrintWindow 渲染的是窗口本身，正好用来把两者分开。
+    """
+    import tempfile
+    from PIL import Image
+    tmp = _tmp("stab", ".png")
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+    try:
+        _grab_window(int(hwnd), tmp)
+        if os.path.exists(tmp) and os.path.getsize(tmp) > 1024:
+            return Image.open(tmp).copy()
+    except Exception:
+        pass
+    return None
+
+
+def wait_stable(window=None, region=None, stable_ms=500, timeout=8.0,
+                threshold=0.004, poll=0.18):
+    """等目标区域**停止变化**：连续 stable_ms 内画面差异都低于 threshold 才算稳。
+
+    为什么要它：点完按钮界面还在动画，立刻截图/OCR 读到的是旧帧，于是
+    “点了没反应”“字没进去”这类误判全来了。稳定后再判断，判据才可信。
+
+    两路同时看：
+      - 屏幕截图（所见即所得，但会被桌宠、弹窗这类覆盖物带偏）
+      - 窗口自绘（PrintWindow，只含窗口自己，但个别 Electron 会返回旧帧）
+    任一路稳住就判稳，并说清是哪一路 —— 免得把“桌宠在动”误判成“窗口没稳”。
+
+    返回：True=稳了；False=超时还在动；None=截不到图（不知道，不是失败）。
+    """
+    need = max(0.1, stable_ms / 1000.0)
+    hwnd = None
+    if window:
+        s = str(window).strip()
+        hwnd = int(s) if s.isdigit() else _hwnd_by_title(s)
+        if hwnd is None:
+            print(f"  UNVERIFIED: 找不到窗口 {window!r}，不拿别的窗口顶替")
+            return None
+    elif not region:
+        hwnd = int(user32.GetForegroundWindow())
+
+    t0 = time.time()
+    ps = _snap_image(window, region)
+    pw = _snap_window_only(hwnd) if hwnd else None
+    if ps is None and pw is None:
+        print("  UNVERIFIED: 截不到图，无法判断界面是否稳定")
+        return None
+
+    settled = {"screen": None, "window": None}
+    last = {}
+    while True:
+        if _abort_if_cancelled("wait_stable"):
+            return False
+        time.sleep(poll)
+        cs = _snap_image(window, region)
+        cw = _snap_window_only(hwnd) if hwnd else None
+        now = time.time()
+
+        for key, prev, cur in (("screen", ps, cs), ("window", pw, cw)):
+            if prev is None or cur is None:
+                continue
+            ratio = _image_diff_ratio(prev, cur)
+            if ratio is None:
+                continue
+            last[key] = ratio
+            if ratio <= threshold:
+                if settled[key] is None:
+                    settled[key] = now
+            else:
+                settled[key] = None
+        ps, pw = cs, cw
+
+        for key in ("screen", "window"):
+            if settled[key] and now - settled[key] >= need:
+                detail = "，".join(f"{k} {v:.2%}" for k, v in last.items())
+                if key == "window" and settled["screen"] is None:
+                    print(f"  stable(窗口自身): 盖在它上面的东西还在动（{detail}），"
+                          f"但窗口内容 {need:.2f}s 没变 → 判稳")
+                else:
+                    print(f"  stable: 画面 {need:.2f}s 没变（{detail}），"
+                          f"用了 {now - t0:.1f}s")
+                return True
+
+        if now - t0 >= timeout:
+            detail = "，".join(f"{k} {v:.2%}" for k, v in last.items()) or "无数据"
+            print(f"  UNSTABLE: {timeout}s 内没稳下来（{detail}）")
+            return False
+
+
 def _seen(text, region):
     """Is `text` on screen right now? With a region, crop+upscale first."""
     needle = _norm(text)
@@ -2434,6 +3259,8 @@ def wait_gone(text, timeout=30.0, region=None, interval=0.7):
     """Wait until a phrase disappears (busy cursors, "请稍候", progress text)."""
     t0 = time.time()
     while True:
+        if _abort_if_cancelled("wait_gone"):
+            return False
         if not _seen(text, region):
             print(f"  gone: {text!r} disappeared after {time.time() - t0:.1f}s")
             return True
@@ -2451,6 +3278,10 @@ def wait_text(text, timeout=20.0, region=None, interval=0.7):
     needle = _norm(text)
     t0 = time.time()
     while True:
+        # 2026-11-11 补：以前只给 wait_gone 挂了急停，wait_text 漏了 —— 急停按下去
+        # 它照样等到超时（实测等满 20 秒），等于没停。
+        if _abort_if_cancelled("wait_text"):
+            return False
         if _seen(text, region):
             print(f"  found '{text}' after {time.time() - t0:.1f}s")
             return True
@@ -2474,6 +3305,8 @@ def scroll_to(text, timeout=25.0, region=None, step=-90, pause=0.35):
     needle = _norm(text)
     t0 = time.time()
     while time.time() - t0 < timeout:
+        if _abort_if_cancelled("scroll_to"):
+            return False
         try:
             lines, _words = screen_text(region)
         except Exception:
@@ -2487,12 +3320,22 @@ def scroll_to(text, timeout=25.0, region=None, step=-90, pause=0.35):
     return False
 
 
-def type_secret(text):
-    """输入敏感内容（密码/令牌），粘完立刻把剪贴板清空。"""
-    type_text(text)
-    time.sleep(0.15)
-    _set_clipboard("")
+def type_secret(text, expect=None):
+    """输入敏感内容（密码/令牌）：粘完立刻清空剪贴板，且**绝不落明文**。
+
+    2026-11-11 修的坑：以前这里直接 type_text(text)，既不传焦点守卫，也不看
+    返回值 —— 字没打进去照样打印 "secret typed"，调用方以为成功了。
+    而且 type_text 会把前 40 字（密码本体）写进 fingerprint.jsonl。
+    现在：守卫照走、结果照报、指纹只记长度。
+    """
+    ok = type_text(text, expect=expect, verify=False, secret=True)
+    time.sleep(0.12)
+    _set_clipboard("")          # 不管成功与否都清掉
+    if not ok:
+        print("  SECRET_NOT_TYPED: 焦点或粘贴失败，密码没有输进去（剪贴板已清）")
+        return False
     print("  secret typed, clipboard cleared")
+    return True
 
 
 def click_label(text, region=None, timeout=4.0):
@@ -2521,5 +3364,122 @@ def click_label(text, region=None, timeout=4.0):
 
 
 
+class _WorkerTee:
+    """原日志实时写 stderr，同时留一份给响应 text；stdout 只走 JSON Lines。"""
+
+    def __init__(self, stream):
+        self.stream = stream
+        self.parts = []
+
+    def write(self, text):
+        self.parts.append(text)
+        self.stream.write(text)
+        self.stream.flush()
+        return len(text)
+
+    def flush(self):
+        self.stream.flush()
+
+    def isatty(self):
+        return False
+
+    def text(self):
+        return "".join(self.parts)
+
+
+def _worker_request(req):
+    """在一个请求里复用 CLI 分派；SystemExit 只结束请求，不结束 worker。"""
+    import contextlib
+    import traceback
+
+    request_id = req.get("id")
+    tool = req["tool"]
+    args = req["args"]
+    # 这些是单次 CLI 的状态，不能漏到下一请求；OCR/临时文件状态则刻意保留。
+    CANCEL_HIT["hit"] = False
+    LAST_TYPE["status"] = "unknown"
+    _EXPECT["v"] = None
+
+    tee = _WorkerTee(sys.stderr)
+    code = 0
+    with contextlib.redirect_stdout(tee), contextlib.redirect_stderr(tee):
+        try:
+            main([tool, *args])
+        except SystemExit as exc:
+            if exc.code is None:
+                code = 0
+            elif isinstance(exc.code, int):
+                code = exc.code
+            else:
+                code = 1
+                print(str(exc.code))       # 与 CLI 的 SystemExit("消息") 一致
+        except Exception:
+            code = 1
+            traceback.print_exc()
+        else:
+            if CANCEL_HIT["hit"]:
+                code = 6
+
+    text = tee.text()
+    data = None
+    for line in reversed(text.splitlines()):
+        if not line.startswith(RESULT_MARK):
+            continue
+        try:
+            value = _json.loads(line[len(RESULT_MARK):].strip())
+            if isinstance(value, dict):
+                data = value
+                break
+        except Exception:
+            pass
+
+    if data and "status" in data:
+        status = data["status"]
+        ok = data.get("ok", status == "success")
+    elif code == 0:
+        status, ok = "success", True
+    elif code == 6:
+        status, ok = "cancelled", False
+    elif code == 5:
+        status, ok = "unverified", None
+    elif code == 3:
+        status, ok = "timeout", False
+    else:
+        status, ok = "error", False
+    # code 是附加字段：插件需要保留 CLI 的 2/3/4/5/6 退出码语义。
+    return {"id": request_id, "ok": ok, "status": status,
+            "text": text, "data": data, "code": code}
+
+
+def worker_loop():
+    """新增模式：pc.py --worker。普通 pc.py <verb> ... 完全不走这里。"""
+    for raw in sys.stdin:
+        request_id = None
+        try:
+            req = _json.loads(raw)
+            if not isinstance(req, dict):
+                raise ValueError("request must be a JSON object")
+            request_id = req.get("id")
+            if not isinstance(req.get("tool"), str) or not req["tool"]:
+                raise ValueError("tool must be a non-empty string")
+            if not isinstance(req.get("args"), list) or not all(isinstance(a, str) for a in req["args"]):
+                raise ValueError("args must be an array of strings")
+            response = _worker_request(req)
+        except Exception as exc:
+            print("worker request error: %s" % exc, file=sys.stderr, flush=True)
+            response = {"id": request_id, "ok": False, "status": "error",
+                        "text": "  worker request error: %s\n" % exc,
+                        "data": None, "code": 1}
+        sys.stdout.write(_json.dumps(response, ensure_ascii=False,
+                                     separators=(",", ":")) + "\n")
+        sys.stdout.flush()
+
+
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    if sys.argv[1:] == ["--worker"]:
+        worker_loop()
+    else:
+        main(sys.argv[1:])
+        # 急停打断过的调用用专门退出码，别让上层把"被叫停"当成"正常做完"
+        if CANCEL_HIT["hit"]:
+            sys.exit(6)

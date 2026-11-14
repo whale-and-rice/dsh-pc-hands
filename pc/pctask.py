@@ -53,6 +53,28 @@ _spec.loader.exec_module(pcmod)
 
 # ---------- conditions ----------
 
+def _fg_fp():
+    """当前前台窗口指纹：(hwnd, pid, title, cls)。"""
+    import ctypes
+    from ctypes import wintypes
+    u = ctypes.windll.user32
+    h = int(u.GetForegroundWindow())
+    pid = wintypes.DWORD(0)
+    u.GetWindowThreadProcessId(h, ctypes.byref(pid))
+    tb = ctypes.create_unicode_buffer(256)
+    u.GetWindowTextW(h, tb, 256)
+    cb = ctypes.create_unicode_buffer(256)
+    u.GetClassNameW(h, cb, 256)
+    return (h, int(pid.value), tb.value or "", cb.value or "")
+
+
+def focus_drifted(target, fg):
+    """target 是标题子串；fg 是 _fg_fp() 的结果。返回 True 表示焦点跑偏了。"""
+    if not target:
+        return False
+    return str(target).lower() not in (fg[2] or "").lower()
+
+
 def find_window(title_part: str):
     """Return (hwnd, title) for the first visible window whose title contains the
     text, or None. Re-queried every time on purpose: handles go stale."""
@@ -306,12 +328,62 @@ def do_seek(step, log):
     raise RuntimeError(f"seek: {needle!r} not found within {max_pages} page turns")
 
 
+def do_changed(step, log):
+    """界面到底变没变 —— 48x48 灰度差分，给数不给感觉。
+
+    两种用法：
+      {"do": "changed", "baseline": "工作区\\基线.png"}         # 滚动基线
+      {"do": "changed", "before": "a.png", "after": "b.png"}    # 指定两张
+
+    默认 expect="change"（界面必须变）；写 expect="same" 就是断言"不该变"。
+    这条的意义：`click` 只证明"动作发出去了"，`changed` 才证明"界面有反应"。
+    """
+    import shutil
+    import tempfile
+
+    thr = float(step.get("min", pcmod.CHANGED_FRAC))
+    expect = step.get("expect", "change")
+
+    if step.get("before") and step.get("after"):
+        frac, diff = pcmod.changed_score(step["before"], step["after"])
+    else:
+        base = step.get("baseline")
+        if not base:
+            raise RuntimeError("changed: 需要 baseline，或 before+after")
+        cur = os.path.join(tempfile.gettempdir(), "pctask-changed-now.png")
+        pcmod.shot(cur, step.get("window"))
+        if not os.path.exists(base):
+            shutil.copyfile(cur, base)
+            log(f"baseline created: {base}")
+            return "baseline"
+        frac, diff = pcmod.changed_score(base, cur)
+        shutil.copyfile(cur, base)      # 滚动：这次成为下次的基线
+
+    is_changed = frac >= thr
+    log(f"changed={1 if is_changed else 0} frac={frac:.4f} mean={diff:.2f} min={thr:.3f}")
+    if expect == "change" and not is_changed:
+        raise RuntimeError(f"界面没变 (frac {frac:.3f} < {thr:.3f})")
+    if expect == "same" and is_changed:
+        raise RuntimeError(f"界面变了 (frac {frac:.3f} >= {thr:.3f})")
+    return is_changed
+
+
+# 证据等级：动作发出 ≠ 界面变了 ≠ 结果验到了。
+# 抄这一层的动机很实在 —— 以前日记里写"点了"，其实什么都没发生。
+EVIDENCE = {
+    "click": "sent", "click_text": "sent", "type": "sent", "key": "sent",
+    "scroll": "sent", "uia": "sent", "seek": "sent",
+    "shot": "ui_changed", "changed": "ui_changed",
+    "assert": "verified", "assert_text": "verified", "conread": "verified",
+    "want": "ui_changed", "launch": "sent", "activate": "ui_changed",
+}
+
 VERBS = {
     "launch": do_launch, "want": do_want, "activate": do_activate, "uia": do_uia,
     "key": do_key, "type": do_type, "scroll": do_scroll, "shot": do_shot,
     "assert": do_assert, "sleep": do_sleep, "notify": do_notify,
     "assert_text": do_assert_text, "click_text": do_click_text, "seek": do_seek,
-    "click": do_click,
+    "click": do_click, "changed": do_changed,
 }
 
 
@@ -321,10 +393,13 @@ def run_plan(plan: dict, dry: bool = False) -> int:
     steps = plan.get("steps", [])
     print(f"  plan: {plan.get('name', '(unnamed)')}  steps={len(steps)}")
     results = []
+    TARGET = plan.get("target") or ""
+    INPUT_VERBS = {"key", "type", "click", "scroll", "hotkey"}
     for i, step in enumerate(steps, 1):
         verb = step.get("do")
         fn = VERBS.get(verb)
         label = f"[{i}/{len(steps)}] {verb}"
+        fg0 = _fg_fp()
         if fn is None:
             print(f"  {label}  UNKNOWN VERB")
             return 2
@@ -335,8 +410,20 @@ def run_plan(plan: dict, dry: bool = False) -> int:
         for attempt in range(1, tries + 1):
             try:
                 fn(step, lambda m: print(f"  {label}  {m}"))
-                results.append({"step": i, "verb": verb, "ok": True,
-                                "ms": int((time.time() - t0) * 1000), "attempt": attempt})
+                fg1 = _fg_fp()
+                drifted = verb in INPUT_VERBS and (
+                    focus_drifted(TARGET, fg1) or (not TARGET and fg1[0] != fg0[0]))
+                results.append({"step": i, "verb": verb, "ok": not drifted,
+                                "evidence": EVIDENCE.get(verb, "none"),
+                                "ms": int((time.time() - t0) * 1000), "attempt": attempt,
+                                "fg_before": fg0, "fg_after": fg1})
+                if drifted:
+                    print("  FOCUS_DRIFT after %s: 前台变成了 [%s] %r"
+                          % (verb, fg1[1], fg1[2][:60]))
+                    print("  STOP: 输入类动作前后焦点变了，后面的步骤不再执行"
+                          "（继续下去只会把按键送错窗口）")
+                    last = RuntimeError("focus drift -> %r" % (fg1[2],))
+                    break
                 last = None
                 break
             except Exception as exc:
@@ -346,6 +433,7 @@ def run_plan(plan: dict, dry: bool = False) -> int:
                     time.sleep(gap)
         else:
             results.append({"step": i, "verb": verb, "ok": False,
+                            "evidence": EVIDENCE.get(verb, "none"),
                             "ms": int((time.time() - t0) * 1000), "error": str(last)})
             if step.get("on_fail", plan.get("on_fail", "stop")) == "stop":
                 print(f"  STOP at step {i} ({verb}): {last}")

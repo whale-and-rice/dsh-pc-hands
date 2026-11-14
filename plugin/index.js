@@ -108,6 +108,146 @@ function run(conf, args, timeoutMs) {
   return { code, out, error: err || null, timedOut }
 }
 
+// pc.py 的唯一常驻连接。一个实例只允许一个请求在途；传输失败后整批拒绝，
+// 不把已发送或排队请求偷偷交给新进程重放。
+let WORKER_REQUEST_ID = 0
+class PcWorker {
+  constructor(conf, script) {
+    this.conf = conf
+    this.script = script
+    this.child = null
+    this.queue = []
+    this.inflight = null
+    this.stdoutBuf = ''
+    this.stderrBuf = ''
+  }
+
+  request(args, timeoutMs) {
+    return new Promise((resolve) => {
+      this.queue.push({
+        id: `${process.pid}-${++WORKER_REQUEST_ID}`,
+        args: args.map(String),
+        timeoutMs: timeoutMs || this.conf.timeoutMs,
+        resolve,
+        timer: null,
+        stderrAt: 0,
+      })
+      this._pump()
+    })
+  }
+
+  _ensureWorker() {
+    if (this.child) return
+    const child = spawn(this.conf.python, ['-X', 'utf8', this.script, '--worker'], {
+      cwd: this.conf.dir,
+      env: {
+        ...process.env,
+        PYTHONUTF8: '1',
+        PYTHONIOENCODING: 'utf-8',
+        PYTHONUNBUFFERED: '1',
+      },
+      stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
+    })
+    this.child = child
+    this.stdoutBuf = ''
+    this.stderrBuf = ''
+    child.stdout.setEncoding('utf8')
+    child.stderr.setEncoding('utf8')
+    child.stdout.on('data', (chunk) => {
+      if (this.child !== child) return
+      this.stdoutBuf += chunk
+      for (;;) {
+        const at = this.stdoutBuf.indexOf('\n')
+        if (at < 0) break
+        const line = this.stdoutBuf.slice(0, at).replace(/\r$/, '')
+        this.stdoutBuf = this.stdoutBuf.slice(at + 1)
+        if (line) this._onLine(line, child)
+      }
+    })
+    child.stderr.on('data', (chunk) => {
+      if (this.child === child) this.stderrBuf += chunk
+    })
+    child.stdin.on('error', (error) => {
+      if (this.child === child) this._failAll(`worker stdin: ${error.message || error}`)
+    })
+    child.on('error', (error) => {
+      if (this.child === child) this._failAll(`worker exec failed: ${error.message || error}`)
+    })
+    child.on('exit', (code, signal) => {
+      if (this.child === child) {
+        this._failAll(`worker exited (code=${code}, signal=${signal || 'none'})`)
+      }
+    })
+  }
+
+  _pump() {
+    if (this.inflight || this.queue.length === 0) return
+    const req = this.queue.shift()
+    this.inflight = req
+    try {
+      this._ensureWorker()
+      req.stderrAt = this.stderrBuf.length
+      req.timer = setTimeout(() => {
+        if (this.inflight === req) {
+          this._failAll(`exec timed out after ${Math.round(req.timeoutMs / 1000)}s`, true)
+        }
+      }, req.timeoutMs)
+      const line = JSON.stringify({ id: req.id, tool: req.args[0], args: req.args.slice(1) }) + '\n'
+      this.child.stdin.write(line, 'utf8', (error) => {
+        if (error && this.inflight === req) this._failAll(`worker write failed: ${error.message || error}`)
+      })
+    } catch (error) {
+      this._failAll(`worker start/write failed: ${error.message || error}`)
+    }
+  }
+
+  _onLine(line, child) {
+    if (this.child !== child) return
+    let msg
+    try {
+      msg = JSON.parse(line)
+      if (!msg || typeof msg !== 'object' || !this.inflight || msg.id !== this.inflight.id) {
+        throw new Error('missing or mismatched response id')
+      }
+    } catch (error) {
+      this._failAll(`worker protocol error: ${error.message || error}; line=${line.slice(0, 300)}`)
+      return
+    }
+    const req = this.inflight
+    clearTimeout(req.timer)
+    this.inflight = null
+    const code = Number.isInteger(msg.code) ? msg.code : (msg.ok === true ? 0 : 1)
+    req.resolve({ code, out: String(msg.text || '').trim(), error: null, timedOut: false })
+    this.stderrBuf = ''
+    this._pump()
+  }
+
+  _failAll(message, timedOut = false) {
+    const child = this.child
+    const active = this.inflight
+    const rejected = [...(active ? [active] : []), ...this.queue]
+    const logs = active ? this.stderrBuf.slice(active.stderrAt).trim() : this.stderrBuf.trim()
+    this.child = null
+    this.inflight = null
+    this.queue = []
+    if (active?.timer) clearTimeout(active.timer)
+    if (child && !child.killed) child.kill()
+    const prefix = timedOut
+      ? `  ${message}（worker 已杀；本次及排队请求全部拒绝，绝不重发）`
+      : `  ${message}（worker 已杀；本次及排队请求全部拒绝，后续新请求会重启，绝不重发）`
+    for (const req of rejected) {
+      if (req.timer) clearTimeout(req.timer)
+      req.resolve({
+        code: -1,
+        out: `${prefix}\n${logs}`.trim(),
+        error: message,
+        timedOut: req === active && timedOut,
+      })
+    }
+  }
+}
+
 
 function ps(conf, args, timeoutMs) {
   const res = spawnSync('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ...args], {
@@ -129,6 +269,59 @@ function tail(text, lines = 40, chars = 6000) {
   const arr = text.split(/\r?\n/)
   const sliced = arr.slice(-lines).join('\n')
   return sliced.length > chars ? sliced.slice(-chars) : sliced
+}
+
+// 2026-11-11：pc.py 现在会多打一行 `##RESULT## {json}`，把"做成了 / 没找到 / 不知道"
+// 分成三态。以前插件只能靠正则猜输出，于是 OCR 跑挂了和真的没找到长得一样。
+const RESULT_MARK = '##RESULT##'
+
+function parseResult(out) {
+  if (!out) return null
+  const idx = out.lastIndexOf(RESULT_MARK)
+  if (idx < 0) return null
+  const line = out.slice(idx + RESULT_MARK.length).split(/\r?\n/)[0].trim()
+  try {
+    return JSON.parse(line)
+  } catch {
+    return null
+  }
+}
+
+// 跑一次 pc.py 并尽量拿到结构化结果；拿不到就把退出码翻译成三态。
+async function pyResult(conf, script, args, timeoutMs, runner = null) {
+  const res = runner
+    ? await runner(script, args, timeoutMs)
+    : run(conf, [join(conf.dir, script), ...args], timeoutMs)
+  const parsed = parseResult(res.out)
+  if (parsed) return { ...res, result: parsed }
+  const status = res.code === 0 ? 'success'
+    : res.code === 6 ? 'cancelled'
+      : res.code === 5 ? 'unverified'
+        : res.code === 3 ? 'timeout'
+          : 'error'
+  return {
+    ...res,
+    result: {
+      status,
+      ok: status === 'success' ? true : (status === 'unverified' ? null : false),
+      inferred: true,
+    },
+  }
+}
+
+// 把三态翻成人和模型都能读的一句话
+function describeResult(r) {
+  const s = r && r.result ? r.result.status : 'unknown'
+  const map = {
+    success: '成功',
+    not_found: '没找到（OCR 正常跑完，就是没有这段字）',
+    timeout: '超时（等到了上限）',
+    cancelled: '被急停叫停',
+    unverified: '验不了（既不是成功也不是失败）',
+    not_confirmed: '没确认（字没进去）',
+    error: '出错（引擎/参数/焦点问题，不是"没找到"）',
+  }
+  return map[s] || s
 }
 
 // ---- 动键鼠前后的提示 · 2026-10-23 主人提的，2026-10-30 改 ----
@@ -193,10 +386,10 @@ function announceEnd() {
 
 // 包一层：动键鼠的工具进来先响一声，出去定个「结束」
 function withHands(fn, startText) {
-  return function (args) {
+  return async function (args) {
     announceStart(startText)
     try {
-      return fn(args)
+      return await fn(args)
     } finally {
       announceEnd()
     }
@@ -216,7 +409,7 @@ function applyInner(ctx, config) {
         description: 'PC 手眼插件的自检：报告脚本目录/Python/Pillow/OCR 的状态。当前脚本目录没找到，先跑这个看怎么修。',
         parameters: {},
         output: { schema: { type: 'json' }, render: (_a, v) => [{ type: 'text', text: v.text || v.error || '' }] },
-        execute() {
+        async execute() {
           return {
             ok: false,
             text: [
@@ -241,7 +434,14 @@ function applyInner(ctx, config) {
   const shotsDir = join(conf.dir, 'shots')
   try { mkdirSync(shotsDir, { recursive: true }) } catch { /* exists */ }
 
-  const py = (script, args, timeout) => run(conf, [join(conf.dir, script), ...args], timeout)
+  const pcWorker = new PcWorker(conf, join(conf.dir, 'pc.py'))
+  const py = async (script, args, timeout) => {
+    if (script === 'pc.py') return pcWorker.request(args, timeout)
+    // pctask.py 仍走原单次进程；它的内部任务语义不在这次改造范围内。
+    return run(conf, [join(conf.dir, script), ...args], timeout)
+  }
+  // 同一次调用，但把 pc.py 的 `##RESULT##` 解析出来（拿不到就按退出码推三态）
+  const pyJson = (script, args, timeout) => pyResult(conf, script, args, timeout, py)
 
   // 注册失败必须留证据：不然只能看到 apply-enter 就没了（第一次就是这样盲猜的）
   let registered = 0
@@ -255,10 +455,10 @@ function applyInner(ctx, config) {
   const wrapHands = (def) => {
     if (!def || !HANDS.has(def.name) || typeof def.execute !== 'function') return def
     const orig = def.execute.bind(def)
-    def.execute = function (...callArgs) {
+    def.execute = async function (...callArgs) {
       announceStart(def.name === 'pc_task' ? '本鲸开始跑一串操作了' : '本鲸开始动键鼠了')
       try {
-        return orig(...callArgs)
+        return await orig(...callArgs)
       } finally {
         announceEnd()
       }
@@ -287,25 +487,43 @@ function applyInner(ctx, config) {
       '截屏并识别屏幕上的文字（Windows 原生 OCR），返回文本 + 截图路径。' +
       '用途：确认界面现在是什么、某段文字在不在、需要本鲸亲眼看时先拿图。' +
       'window 传窗口标题的子串就只截那个窗口；不传截整个屏幕。' +
-      '注意：OCR 对中文会把字拆开、偶有错字，关键结论仍要自己看截图。',
+      '给了窗口时会先用 UIA 读控件文字（精确、中文不会拆字），读不到才退回 OCR；' +
+      '返回里的 source 会说明这次用的是 uia 还是 ocr。' +
+      '注意：UIA 读出来是控件树（按钮/列表项都带 [Button] 这类标签），OCR 则会把中文拆开、偶有错字。',
     parameters: {
       window: { type: 'string', description: '窗口标题子串（可选）' },
       name: { type: 'string', description: '截图文件名的前缀（可选，默认 see）' },
       region: { type: 'string', description: '只截这一块 x0,y0,x1,y1（可选）。小区域会先放大 2 倍再识别，字反而更准、也快得多' },
     },
     output: { schema: { type: 'json' }, render: (_a, v) => [{ type: 'text', text: v.text || v.error || '' }] },
-    execute(args) {
+    async execute(args) {
       const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
       const out = join(shotsDir, `${args.name || 'see'}-${stamp}.png`)
+      // 2026-11-11：给了窗口就走 pc.py 的 see（UIA 优先，读不到退回 OCR）。
+      // 实测 DSH 这种 Electron 窗口 UIA 能给出 400 行精确文字，而 OCR 把「插件」读成「旧 应 甲」。
+      if (args.window) {
+        const seeArgs = ['see', '--out', out, '--window', String(args.window)]
+        if (args.region) seeArgs.push('--region', String(args.region))
+        const res = await py('pc.py', seeArgs)
+        const parsed = parseResult(res.out)
+        const lines = parsed.lines || []
+        return {
+          ok: res.code === 0,
+          image: out,
+          source: parsed.source || null,
+          text: lines.join('\n') || parsed.text || '(没有读到文字)',
+          raw: tail(res.out, 5, 800),
+        }
+      }
       const shotArgs = ['shot', '--out', out]
-      if (args.window) shotArgs.push('--window', String(args.window))
       if (args.region) shotArgs.push('--region', String(args.region))
-      const shotRes = py('pc.py', shotArgs)
-      const ocrRes = py('pc.py', ['ocr', '--image', out])
+      const shotRes = await py('pc.py', shotArgs)
+      const ocrRes = await py('pc.py', ['ocr', '--image', out])
       const lines = ocrRes.out.split(/\r?\n/).filter((l) => l.trim() && !l.includes('saved ') && !l.startsWith('  ok='))
       const result = {
         ok: shotRes.code === 0 && ocrRes.code === 0,
         image: out,
+        source: 'ocr',
         text: lines.join('\n') || '(没有识别到文字)',
         raw: tail(ocrRes.out, 5, 800),
       }
@@ -328,13 +546,44 @@ function applyInner(ctx, config) {
       pick: { type: 'string', description: 'first / top / last / bottom，多个候选时取哪个（默认 first）' },
     },
     output: { schema: { type: 'json' }, render: (_a, v) => [{ type: 'text', text: v.message }] },
-    execute(args) {
+    async execute(args) {
       if (!args.text) return { ok: false, message: '需要 text' }
-      if (args.window) py('pc.py', ['activate', String(args.window)])
-      const res = py('pc.py', ['findtext', String(args.text), ...narrowArgs(args)])
-      const m = res.out.match(/at \((\d+),(\d+)\)/)
-      if (!m) return { ok: false, x: null, y: null, message: `没找到「${args.text}」` }
-      return { ok: true, x: Number(m[1]), y: Number(m[2]), message: res.out.trim() }
+      if (args.window) await py('pc.py', ['activate', String(args.window)])
+      const res = await pyJson('pc.py', ['findtext', String(args.text), ...narrowArgs(args)])
+      const r = res.result || {}
+      if (r.status === 'success' && Array.isArray(r.point)) {
+        return { ok: true, status: 'success', x: r.point[0], y: r.point[1], message: tail(res.out, 3, 300) }
+      }
+      if (r.status === 'not_found') {
+        return { ok: false, status: 'not_found', x: null, y: null, message: `没找到「${args.text}」` }
+      }
+      // 引擎没跑起来 / OCR 挂了 / 超时 / 被急停 —— 这些都不是"没找到"
+      return {
+        ok: r.ok === null ? null : false,
+        status: r.status || 'error',
+        x: null, y: null,
+        message: `没能查找「${args.text}」：${describeResult(res)}\n` + tail(res.out, 4, 400),
+      }
+    },
+  }))
+
+  // ---- 急停 ----
+  reg(defineTool({
+    name: 'pc_cancel',
+    description:
+      '急停：让正在跑的动作（滚动、等待、点按、任务步骤）**在下一步就停**。'
+      + '不是杀进程——杀外层进程清不掉 Python 里正在转的循环，旗标才能。'
+      + '取消只阻止后续动作，**不会撤销已经发生的点击**，这一点别含糊。'
+      + '用完记得 clear:true 解除，否则后面的动作也会被拦住。',
+    parameters: {
+      clear: { type: 'boolean', description: 'true = 解除急停（恢复可操作）' },
+    },
+    output: { schema: { type: 'json' }, render: (_a, v) => [{ type: 'text', text: v.message }] },
+    async execute(args) {
+      const a = args.clear ? ['cancel', '--clear'] : ['cancel']
+      // 急停不能排在长请求后面：用独立单次进程立刻写/清旗标，不进 worker FIFO。
+      const r = run(conf, [join(conf.dir, 'pc.py'), ...a], 30000)
+      return { ok: r.code === 0, message: tail(r.out, 2, 300) }
     },
   }))
 
@@ -363,11 +612,11 @@ function applyInner(ctx, config) {
       expect: { type: 'string', description: '焦点守卫（强烈建议填）：目标窗口标题子串或 hwnd。不是前台就先抢前台再复核，抢不回来直接报错中止，绝不盲打。' },
     },
     output: { schema: { type: 'json' }, render: (_a, v) => [{ type: 'text', text: v.message }] },
-    execute(args) {
+    async execute(args) {
       if (args.labelText) {
         const a = ['clicklabel', String(args.labelText)]
         if (args.region) a.push('--region', String(args.region))
-        const res = py('pc.py', a, 90000)
+        const res = await py('pc.py', a, 90000)
         return { ok: /clicked label/i.test(res.out), message: tail(res.out, 5, 400) }
       }
       if (args.near) {
@@ -380,13 +629,13 @@ function applyInner(ctx, config) {
         if (args.verify) a.push('--verify', String(args.verify))
         if (Number.isFinite(args.timeout)) a.push('--timeout', String(args.timeout))
         if (args.expect) a.push('--expect', String(args.expect))
-        const res = py('pc.py', a, 90000)
+        const res = await py('pc.py', a, 90000)
         return { ok: res.code === 0, message: tail(res.out, 8, 700) }
       }
       if (args.text) {
         const _ct = ['clicktext', String(args.text), ...narrowArgs(args)]
         if (args.expect) _ct.push('--expect', String(args.expect))
-        const res = py('pc.py', _ct)
+        const res = await py('pc.py', _ct)
         return { ok: res.code === 0, message: tail(res.out, 8, 700) }
       }
       if (typeof args.x === 'number' && typeof args.y === 'number') {
@@ -394,11 +643,11 @@ function applyInner(ctx, config) {
         if (args.double) a.push('--double')
         if (args.expect) a.push('--expect', String(args.expect))
         if (args.verify) a.push('--verify', String(args.verify))
-        const res = py('pc.py', a, 90000)
+        const res = await py('pc.py', a, 90000)
         return { ok: res.code === 0, message: tail(res.out, 4, 400) }
       }
       if (args.window && args.name) {
-        const res = py('pc.py', ['seq', `sel ${args.window} ${args.name}`])
+        const res = await py('pc.py', ['seq', `sel ${args.window} ${args.name}`])
         return { ok: res.code === 0, message: tail(res.out, 8, 700) }
       }
       return { ok: false, message: '要么给 text，要么给 x/y，要么给 window+name' }
@@ -408,20 +657,29 @@ function applyInner(ctx, config) {
   reg(defineTool({
     name: 'pc_type',
     description: '往当前焦点里打字（中文走 Win32 剪贴板，所以任何程序都吃得下）。'
-      + '要求：先把目标窗口激活并有输入焦点，否则字会跑到别处。',
+      + '要求：先把目标窗口激活并有输入焦点，否则字会跑到别处。'
+      + 'verify=true 时打完会自己验：先 OCR 找这段字，认不准再看画面像素变没变——'
+      + '它会明确告诉你「已确认 / 像已输入 / 没进去」，不会像以前那样默默报成功。',
     parameters: {
       text: { type: 'string', description: '要输入的文字' },
       secret: { type: 'boolean', description: '敏感内容（密码/令牌）：粘完立刻清空剪贴板' },
+      verify: { type: 'boolean', description: '打完自校验（可选，推荐）：Electron 这类窗口光看返回码不可靠' },
       expect: { type: 'string', description: '焦点守卫（强烈建议填）：目标窗口标题子串或 hwnd。不是前台就先抢前台再复核，抢不回来直接报错中止，绝不盲打。' },
     },
     output: { schema: { type: 'json' }, render: (_a, v) => [{ type: 'text', text: v.message }] },
-    execute(args) {
+    async execute(args) {
       if (!args.text) return { ok: false, message: '需要 text' }
       const a = ['type', String(args.text)]
       if (args.expect) a.push('--expect', String(args.expect))
+      if (args.verify) a.push('--verify')
       if (args.secret) a.push('--secret')
-      const res = py('pc.py', a)
-      return { ok: res.code === 0, message: tail(res.out, 4, 400) }
+      const res = await pyJson('pc.py', a, 120000)
+      const st = res.result ? res.result.status : (res.code === 0 ? 'success' : 'error')
+      return {
+        ok: st === 'success' ? true : (st === 'unverified' ? null : false),
+        status: st,
+        message: `${describeResult(res)}\n` + tail(res.out, 5, 400),
+      }
     },
   }))
 
@@ -433,13 +691,13 @@ function applyInner(ctx, config) {
       expect: { type: 'string', description: '焦点守卫（强烈建议填）：目标窗口标题子串或 hwnd。不是前台就先抢前台再复核，抢不回来直接报错中止，绝不盲打。' },
     },
     output: { schema: { type: 'json' }, render: (_a, v) => [{ type: 'text', text: v.message }] },
-    execute(args) {
+    async execute(args) {
       if (!args.keys) return { ok: false, message: '需要 keys' }
       const combo = String(args.keys)
       const _cb = combo.includes('+') ? 'hotkey' : 'key'
       const _a = [_cb, combo]
       if (args.expect) _a.push('--expect', String(args.expect))
-      const res = py('pc.py', _a)
+      const res = await py('pc.py', _a)
       return { ok: res.code === 0, message: tail(res.out, 4, 400) }
     },
   }))
@@ -457,13 +715,49 @@ function applyInner(ctx, config) {
       gone: { type: 'boolean', description: '反过来：等这段文字消失（转圈、"请稍候"、进度条）' },
     },
     output: { schema: { type: 'json' }, render: (_a, v) => [{ type: 'text', text: v.text }] },
-    execute(args) {
+    async execute(args) {
       const a = ['waittext', String(args.text), '--timeout', String(Number.isFinite(args.timeout) ? args.timeout : 20)]
       if (args.region) a.push('--region', String(args.region))
       if (args.gone) a.push('--gone')
-      const r = py('pc.py', a, 180000)
-      const ok = args.gone ? /gone: .* disappeared/i.test(r.out) : /found '/i.test(r.out)
-      return { ok, text: tail(r.out, 3, 300) }
+      const r = await pyJson('pc.py', a, 180000)
+      const st = r.result ? r.result.status : (r.code === 0 ? 'success' : 'error')
+      return {
+        ok: st === 'success' ? true : (st === 'unverified' ? null : false),
+        status: st,
+        text: `${describeResult(r)}\n` + tail(r.out, 3, 300),
+      }
+    },
+  }))
+
+  // ---- 等界面稳定 ----
+  reg(defineTool({
+    name: 'pc_wait_stable',
+    description:
+      '等目标窗口/区域**停止变化**再动手（默认连续 0.5 秒没变即算稳）。'
+      + '为什么需要它：点完按钮界面还在动画，立刻截图或 OCR 会读到旧帧，'
+      + '于是“点了没反应”“字没进去”这类误判全来了。稳定后再判断，判据才可信。'
+      + '它会同时看屏幕截图和窗口自绘两路：桌宠、弹窗压在窗口上面也骗不过它。',
+    parameters: {
+      window: { type: 'string', description: '窗口标题子串或 hwnd（可选，缺省用前台窗口）' },
+      region: { type: 'string', description: '只看这块区域：x0,y0,x1,y1（可选，给了就只量这里，最准）' },
+      stableMs: { type: 'number', description: '连续多久没变算稳定，毫秒（默认 500）' },
+      timeout: { type: 'number', description: '最多等多少秒（默认 8）' },
+    },
+    output: { schema: { type: 'json' }, render: (_a, v) => [{ type: 'text', text: v.message }] },
+    async execute(args) {
+      const a = ['waitstable']
+      if (args.window) a.push('--window', String(args.window))
+      if (args.region) a.push('--region', String(args.region))
+      a.push('--stable', String(Number.isFinite(args.stableMs) ? args.stableMs : 500))
+      a.push('--timeout', String(Number.isFinite(args.timeout) ? args.timeout : 8))
+      const r = await pyJson('pc.py', a, (Number.isFinite(args.timeout) ? args.timeout : 8) * 1000 + 20000)
+      // 三态分开报：稳了 / 没稳（超时）/ 验不了（截不到图）/ 被急停
+      const st = r.result ? r.result.status : (r.code === 0 ? 'success' : 'error')
+      return {
+        ok: st === 'success' ? true : (st === 'unverified' ? null : false),
+        status: st,
+        message: `${describeResult(r)}\n` + tail(r.out, 4, 400),
+      }
     },
   }))
 
@@ -487,15 +781,15 @@ function applyInner(ctx, config) {
       y: { type: 'number', description: '先移动指针到的 y（可选）' },
     },
     output: { schema: { type: 'json' }, render: (_a, v) => [{ type: 'text', text: v.ok ? ('滚动 ' + v.amount) : (v.error || '滚动失败') }] },
-    execute(args) {
+    async execute(args) {
       if (Number.isFinite(args.x) && Number.isFinite(args.y)) {
-        py('pc.py', ['move', String(Math.trunc(args.x)), String(Math.trunc(args.y))])
+        await py('pc.py', ['move', String(Math.trunc(args.x)), String(Math.trunc(args.y))])
       }
       if (args.untilText) {
         const a = ['scrollto', String(args.untilText),
           '--timeout', String(Number.isFinite(args.timeout) ? args.timeout : 25)]
         if (args.region) a.push('--region', String(args.region))
-        const r = py('pc.py', a, 120000)
+        const r = await py('pc.py', a, 120000)
         return { ok: r.code === 0 && !/not found|timeout/i.test(r.out), out: tail(r.out, 4, 300) }
       }
       if (Number.isFinite(args.horizontal)) {
@@ -504,15 +798,17 @@ function applyInner(ctx, config) {
         if (Number.isFinite(args.x) && Number.isFinite(args.y)) {
           a.push('--at', Math.trunc(args.x) + ',' + Math.trunc(args.y))
         }
-        const r = py('pc.py', a)
+        const r = await py('pc.py', a)
         return { ok: r.code === 0, amount: n, out: tail(r.out, 3, 200) }
       }
       if (Number.isFinite(args.pixels)) {
-        const r = py('pc.py', ['scroll', '--px', String(Math.trunc(args.pixels))])
+        const r = await py('pc.py', ['scroll', '--px', String(Math.trunc(args.pixels))])
         return { ok: r.code === 0, out: tail(r.out, 3, 200) }
       }
       const amount = Number.isFinite(args.amount) ? Math.trunc(args.amount) : -1200
-      const r = py('pc.py', ['scroll', String(amount)])
+      // amount 是「滚轮增量」（一格 120），不是格数：必须走 --delta。
+      // 2026-11-11 之前这里传的是裸数字，pc.py 当格数处理，多滚了 100 倍。
+      const r = await py('pc.py', ['scroll', '--delta', String(amount)])
       return { ok: r.code === 0, amount, out: tail(r.out, 4, 300) }
     },
   }))
@@ -528,12 +824,12 @@ function applyInner(ctx, config) {
       text: { type: 'string', description: 'action=set 时要写进去的文本' },
     },
     output: { schema: { type: 'json' }, render: (_a, v) => [{ type: 'text', text: v.ok ? (v.action === 'get' ? (v.text || '(空)') : v.out) : ('失败: ' + (v.error || '')) }] },
-    execute(args) {
+    async execute(args) {
       if (args.action === 'set') {
-        const r = py('pc.py', ['clipset', String(args.text ?? '')])
+        const r = await py('pc.py', ['clipset', String(args.text ?? '')])
         return { ok: r.code === 0, action: 'set', out: tail(r.out, 3, 200) }
       }
-      const r = py('pc.py', ['clipget'])
+      const r = await py('pc.py', ['clipget'])
       return { ok: r.code === 0, action: 'get', text: r.out.replace(/\r/g, '') }
     },
   }))
@@ -546,8 +842,8 @@ function applyInner(ctx, config) {
       + '剪贴板、通知脚本是否就绪。装完/换机器后先跑这个；出问题也先跑这个。',
     parameters: {},
     output: { schema: { type: 'json' }, render: (_a, v) => [{ type: 'text', text: v.text || v.error || '' }] },
-    execute() {
-      const r = py('pc.py', ['doctor'], 90000)
+    async execute() {
+      const r = await py('pc.py', ['doctor'], 90000)
       const fails = (r.out.match(/FAIL/g) || []).length
       if (r.code !== 0 && !r.out) {
         return {
@@ -571,8 +867,8 @@ function applyInner(ctx, config) {
     description: '列出当前可见窗口（hwnd/pid/位置/标题），用来确认「要操作的是哪个窗口」——句柄会变，别缓存。',
     parameters: {},
     output: { schema: { type: 'json' }, render: (_a, v) => [{ type: 'text', text: v.text }] },
-    execute() {
-      const res = py('pc.py', ['windows'])
+    async execute() {
+      const res = await py('pc.py', ['windows'])
       return { ok: res.code === 0, text: tail(res.out, 45, 5000) }
     },
   }))
@@ -591,12 +887,12 @@ function applyInner(ctx, config) {
       step: { type: 'number', description: '每次下移多少像素（默认 22）' },
     },
     output: { schema: { type: 'json' }, render: (_a, v) => [{ type: 'text', text: v.message }] },
-    execute(args) {
+    async execute(args) {
       if (typeof args.x !== 'number' || typeof args.y0 !== 'number' || typeof args.y1 !== 'number') {
         return { ok: false, message: '需要 x / y0 / y1' }
       }
       if (!args.verify || !args.region) return { ok: false, message: '需要 verify 与 region' }
-      const res = py('pc.py', ['scanclick', String(Math.round(args.x)),
+      const res = await py('pc.py', ['scanclick', String(Math.round(args.x)),
         Math.round(args.y0) + '-' + Math.round(args.y1),
         '--verify', String(args.verify), '--vregion', String(args.region),
         '--step', String(Math.round(args.step || 22))], 180000)
@@ -618,12 +914,12 @@ function applyInner(ctx, config) {
       depth: { type: 'number', description: 'tree 的深度，默认 3' },
     },
     output: { schema: { type: 'json' }, render: (_a, v) => [{ type: 'text', text: v.text }] },
-    execute(args) {
+    async execute(args) {
       const action = String(args.action || 'list')
       let hwnd = args.hwnd
       if (!hwnd) {
         if (!args.window) return { ok: false, text: '需要 window（标题子串）或 hwnd' }
-        const w = py('pc.py', ['windows'])
+        const w = await py('pc.py', ['windows'])
         const line = w.out.split(/\r?\n/).find((l) => l.includes(String(args.window)))
         if (!line) return { ok: false, text: '没找到标题含「' + args.window + '」的窗口' }
         hwnd = Number(line.trim().split(/\s+/)[0])
@@ -647,14 +943,14 @@ function applyInner(ctx, config) {
       seconds: { type: 'number', description: 'guard 持续秒数，默认 120' },
     },
     output: { schema: { type: 'json' }, render: (_a, v) => [{ type: 'text', text: v.message }] },
-    execute(args) {
+    async execute(args) {
       const action = String(args.action || 'list')
       if (action === 'guard') {
         const secs = Math.round(args.seconds || 120)
-        const res = py('pc.py', ['guard', '--seconds', String(secs)], (secs + 30) * 1000)
+        const res = await py('pc.py', ['guard', '--seconds', String(secs)], (secs + 30) * 1000)
         return { ok: res.code === 0, message: tail(res.out, 40, 4000) || 'guard 已结束' }
       }
-      const res = py('pc.py', ['popups'])
+      const res = await py('pc.py', ['popups'])
       return { ok: res.code === 0, message: tail(res.out, 30, 3000) || '当前没有对话框' }
     },
   }))
@@ -676,7 +972,7 @@ function applyInner(ctx, config) {
       grab: { type: 'string', description: '抓取点相对窗口左上角的偏移 dx,dy（可选）' },
     },
     output: { schema: { type: 'json' }, render: (_a, v) => [{ type: 'text', text: v.message }] },
-    execute(args) {
+    async execute(args) {
       const hold = Math.round(args.hold || 600)
       const steps = Math.round(args.steps || 18)
       const gap = Math.round(args.gap || 12)
@@ -687,13 +983,13 @@ function applyInner(ctx, config) {
         const a = ['dragwin', String(args.window), String(Math.round(args.x2)), String(Math.round(args.y2)),
           '--hold', String(hold)]
         if (args.grab) a.push('--grab', String(args.grab))
-        const res = py('pc.py', a, 60000)
+        const res = await py('pc.py', a, 60000)
         return { ok: res.code === 0, message: tail(res.out, 8, 600) }
       }
       if ([args.x1, args.y1, args.x2, args.y2].some((v) => typeof v !== 'number')) {
         return { ok: false, message: '要么给 window + x2/y2，要么给 x1/y1/x2/y2' }
       }
-      const res = py('pc.py', ['drag', String(Math.round(args.x1)), String(Math.round(args.y1)),
+      const res = await py('pc.py', ['drag', String(Math.round(args.x1)), String(Math.round(args.y1)),
         String(Math.round(args.x2)), String(Math.round(args.y2)),
         '--hold', String(hold), '--steps', String(steps), '--gap', String(gap)], 60000)
       return { ok: res.code === 0, message: tail(res.out, 8, 600) }
@@ -711,12 +1007,12 @@ function applyInner(ctx, config) {
       y: { type: 'number', description: '新左上角 y' },
     },
     output: { schema: { type: 'json' }, render: (_a, v) => [{ type: 'text', text: v.message }] },
-    execute(args) {
+    async execute(args) {
       if (!args.window) return { ok: false, message: '需要 window' }
       if (typeof args.x !== 'number' || typeof args.y !== 'number') {
         return { ok: false, message: '需要 x / y' }
       }
-      const res = py('pc.py', ['movewin', String(args.window), String(Math.round(args.x)), String(Math.round(args.y))], 30000)
+      const res = await py('pc.py', ['movewin', String(args.window), String(Math.round(args.x)), String(Math.round(args.y))], 30000)
       return { ok: res.code === 0, message: tail(res.out, 6, 500) }
     },
   }))
@@ -735,7 +1031,7 @@ function applyInner(ctx, config) {
       dry: { type: 'boolean', description: '只找不点（配合 text 调试）' },
     },
     output: { schema: { type: 'json' }, render: (_a, v) => [{ type: 'text', text: v.message }] },
-    execute(args) {
+    async execute(args) {
       if (typeof args.x !== 'number' || typeof args.y !== 'number') {
         return { ok: false, message: '需要 x / y' }
       }
@@ -744,10 +1040,10 @@ function applyInner(ctx, config) {
         const a = ['hoverclick', String(Math.round(args.x)), String(Math.round(args.y)), String(args.text),
           '--wait', String(wait)]
         if (args.dry) a.push('--dry')
-        const res = py('pc.py', a, wait + 60000)
+        const res = await py('pc.py', a, wait + 60000)
         return { ok: res.code === 0, message: tail(res.out, 10, 900) }
       }
-      const res = py('pc.py', ['hover', String(Math.round(args.x)), String(Math.round(args.y)), '--wait', String(wait)], 40000)
+      const res = await py('pc.py', ['hover', String(Math.round(args.x)), String(Math.round(args.y)), '--wait', String(wait)], 40000)
       return { ok: res.code === 0, message: tail(res.out, 6, 500) }
     },
   }))
@@ -769,25 +1065,25 @@ function applyInner(ctx, config) {
       tail: { type: 'boolean', description: 'read：只给最后 12 行' },
     },
     output: { schema: { type: 'json' }, render: (_a, v) => [{ type: 'text', text: v.message }] },
-    execute(args) {
+    async execute(args) {
       const action = String(args.action || 'read')
       if (typeof args.hwnd !== 'number') return { ok: false, message: '需要 hwnd' }
       const hwnd = Math.round(args.hwnd)
       if (action === 'read') {
         const a = ['conread', String(hwnd)]
         if (args.tail) a.push('--tail')
-        const res = py('pc.py', a, 30000)
+        const res = await py('pc.py', a, 30000)
         return { ok: res.code === 0, message: tail(res.out, 40, 4000) }
       }
       if (action === 'find') {
         if (!args.find) return { ok: false, message: 'find 需要 find 文字' }
-        const res = py('pc.py', ['wintext', String(hwnd), '--find', String(args.find)], 60000)
+        const res = await py('pc.py', ['wintext', String(hwnd), '--find', String(args.find)], 60000)
         return { ok: res.code === 0, message: tail(res.out, 10, 900) }
       }
       if (action === 'watch') {
         if (!args.until) return { ok: false, message: 'watch 需要 until' }
         const secs = Math.round(args.timeout || 60)
-        const res = py('pc.py', ['watch', String(hwnd), '--until', String(args.until),
+        const res = await py('pc.py', ['watch', String(hwnd), '--until', String(args.until),
           '--timeout', String(secs), '--click'], (secs + 30) * 1000)
         return { ok: res.code === 0, message: tail(res.out, 10, 900) }
       }
@@ -802,9 +1098,9 @@ function applyInner(ctx, config) {
       + '发的是 WM_CLOSE，等于点了右上角，不粗暴。',
     parameters: { window: { type: 'string', description: '窗口标题子串' } },
     output: { schema: { type: 'json' }, render: (_a, v) => [{ type: 'text', text: v.message }] },
-    execute(args) {
+    async execute(args) {
       if (!args.window) return { ok: false, message: '需要 window' }
-      const res = py('pc.py', ['closewin', String(args.window)], 20000)
+      const res = await py('pc.py', ['closewin', String(args.window)], 20000)
       return { ok: res.code === 0, message: tail(res.out, 6, 500) }
     },
   }))
@@ -823,7 +1119,7 @@ function applyInner(ctx, config) {
       journal: { type: 'string', description: 'journal 输出路径（可选）' },
     },
     output: { schema: { type: 'json' }, render: (_a, v) => [{ type: 'text', text: v.text }] },
-    execute(args) {
+    async execute(args) {
       if (!Array.isArray(args.steps) || args.steps.length === 0) {
         return { ok: false, text: '需要非空的 steps 数组' }
       }
@@ -840,7 +1136,7 @@ function applyInner(ctx, config) {
       } catch (e) {
         return { ok: false, text: '写 plan 失败: ' + String(e) }
       }
-      const res = py('pctask.py', ['run', planPath], Math.max(conf.timeoutMs, 180000))
+      const res = await py('pctask.py', ['run', planPath], Math.max(conf.timeoutMs, 180000))
       return { ok: res.code === 0, plan: planPath, text: tail(res.out, 60, 8000) }
     },
   }))

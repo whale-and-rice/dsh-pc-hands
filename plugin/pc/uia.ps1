@@ -78,6 +78,34 @@ if ($Verb -eq "tree") {
     exit 0
 }
 
+if ($Verb -eq "text") {
+    # Dump every visible string in one pass: Name plus ValuePattern value.
+    # This is the cheap alternative to OCR for Win32/WPF windows: exact text,
+    # no pixels, no font guessing. Electron windows expose almost nothing here,
+    # so callers must fall back to OCR when this returns too few lines.
+    $shown = 0
+    foreach ($el in $all) {
+        $c = $el.Current
+        $nm = $c.Name
+        $val = ""
+        $tmp = $null
+        if ($el.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$tmp)) {
+            try { $val = [string]$tmp.Current.Value } catch { $val = "" }
+        }
+        if ([string]::IsNullOrWhiteSpace($nm) -and [string]::IsNullOrWhiteSpace($val)) { continue }
+        $t = $c.ControlType.ProgrammaticName.Replace("ControlType.", "")
+        if (-not [string]::IsNullOrWhiteSpace($val) -and $val -ne $nm) {
+            Write-Output ("{0}`t[{1}]`t{2}" -f $nm, $t, $val)
+        } else {
+            Write-Output ("{0}`t[{1}]" -f $nm, $t)
+        }
+        $shown++
+        if ($shown -ge $Max) { break }
+    }
+    Write-Output "TOTAL lines=$shown of=$($all.Count)"
+    exit 0
+}
+
 if ($Verb -eq "list") {
     $i = 0
     $shown = 0

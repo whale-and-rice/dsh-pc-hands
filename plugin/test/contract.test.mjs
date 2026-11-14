@@ -93,14 +93,15 @@ function extractToolDefs(src) {
 const TOOL_LITERALS = extractToolDefs(SRC)
 const TOOL_NAMES = TOOL_LITERALS.map((d) => d.name).filter((n) => n !== '(unknown)')
 
-// 19 个工具是「对外契约」：少一个就是坏了，多一个要显式改这里
+// 21 个工具是「对外契约」：少一个就是坏了，多一个要显式改这里
 const EXPECTED_NAMES = [
   'pc_click', 'pc_clip', 'pc_close', 'pc_console', 'pc_doctor', 'pc_drag',
   'pc_find', 'pc_guard', 'pc_hover', 'pc_key', 'pc_move', 'pc_scan',
-  'pc_see', 'pc_scroll', 'pc_task', 'pc_type', 'pc_uia', 'pc_wait', 'pc_windows',
+  'pc_cancel', 'pc_see', 'pc_scroll', 'pc_task', 'pc_type', 'pc_uia', 'pc_wait',
+  'pc_wait_stable', 'pc_windows',
 ]
 
-test('工具数量与名字：19 个，且与对外契约一致', () => {
+test('工具数量与名字：21 个，且与对外契约一致', () => {
   const unique = [...new Set(TOOL_NAMES)].sort()
   assert.deepEqual(unique, [...EXPECTED_NAMES].sort(),
     '工具集合变了。真删/真加都行，但必须同步改 EXPECTED_NAMES，并重启 DSH 让 marker 更新')
@@ -248,28 +249,59 @@ test('校验规则与真实 dsh-tools 对账（DSH 改规则这里就红）', { 
 // 跨语言契约：pc.py 打印的东西，插件在解析
 // ---------------------------------------------------------------------------
 
-test('pc.py 的 findtext 输出格式与插件的解析仍然对得上', () => {
+test('pc.py 的结果协议与插件的解析仍然对得上（2026-11-11 改成 ##RESULT## 三态）', () => {
   // 两种目录布局都要能跑：仓库里是 plugin/pc/pc.py，本机装法是 pc/pc.py 与 plugin/ 平级
   const PC_PY_CANDIDATES = [join(PLUGIN_DIR, 'pc', 'pc.py'), join(PLUGIN_DIR, '..', 'pc.py')]
   const PC_PY = PC_PY_CANDIDATES.find((p) => existsSync(p))
   assert.ok(PC_PY, '找不到 pc.py（查过：' + PC_PY_CANDIDATES.join(' / ') + '）')
   const py = readFileSync(PC_PY, 'utf8')
 
-  // 1) pc.py 还在打这一行（格式串里是 {cx},{cy}）
-  const printRe = /find_text: \{needle!r\} at \(\{(\w+)\},\{(\w+)\}\)/
-  assert.ok(printRe.test(py),
-    'pc.py 不再打印 "find_text: ... at ({cx},{cy})" —— 插件的坐标解析会永远失败（表现为「找不到」，但屏幕上明明有）')
+  // 1) pc.py 必须仍然吐出 ##RESULT## 这一行（新协议的锚）
+  assert.ok(py.includes('RESULT_MARK = "##RESULT##"'),
+    'pc.py 的 RESULT_MARK 没了 —— 插件的三态解析会退化成靠退出码猜')
 
-  // 2) 插件还在用同一个正则
-  const REGEX_SRC = '/at \\((\\d+),(\\d+)\\)/'
-  assert.ok(SRC.includes(REGEX_SRC),
-    '插件的 /at \\((\\d+),(\\d+)\\)/ 变了；如果是有意改的，这里也要一起改')
+  // 2) findtext 分支必须发 success(带 point) / not_found / error 三档
+  assert.ok(/emit_result\("success", True, text=rest\[0\], point=/.test(py),
+    'findtext 不再 emit 带 point 的 success —— 插件拿不到坐标')
+  assert.ok(/emit_result\("not_found", False, text=rest\[0\]\)/.test(py),
+    'findtext 不再把"没找到"单独报出来 —— 会和引擎报错混成一个')
 
-  // 3) 拿一行「真样子」的输出喂给那个正则，确认能取出坐标
-  const sample = "  find_text: '许海宁' at (412,166)"
-  const m = new RegExp('at \\((\\d+),(\\d+)\\)').exec(sample)
-  assert.ok(m, '样例输出没被解析出来')
-  assert.deepEqual([Number(m[1]), Number(m[2])], [412, 166], '解析出的坐标不对')
+  // 3) 旧的人话格式也得留着（日志与老调用方还在用）
+  assert.ok(/find_text: \{needle!r\} at \(\{(\w+)\},\{(\w+)\}\)/.test(py),
+    'pc.py 不再打印 "find_text: ... at ({cx},{cy})" —— 旧的解析方会永远失败')
+
+  // 4) 插件在解析 ##RESULT##
+  assert.ok(SRC.includes("const RESULT_MARK = '##RESULT##'"),
+    '插件里找不到 RESULT_MARK —— 解析入口被删了')
+  assert.ok(SRC.includes('function parseResult(') && SRC.includes('function describeResult('),
+    '插件的 parseResult / describeResult 被删了')
+
+  // 5) 拿一行「真样子」的输出喂给解析逻辑，确认能取出三态和坐标
+  const fakeOut = '  find_text: chose (410,160) centre=(412,166)\n'
+    + '##RESULT## {"status": "success", "ok": true, "text": "许海宁", "point": [412, 166]}'
+  const idx = fakeOut.lastIndexOf('##RESULT##')
+  const parsed = JSON.parse(fakeOut.slice(idx + '##RESULT##'.length).split('\n')[0].trim())
+  assert.equal(parsed.status, 'success')
+  assert.deepEqual(parsed.point, [412, 166], '解析出的坐标不对')
+
+  // 6) ok 三态必须分得开：null 表示"不知道"，不是 false
+  const unv = JSON.parse('{"status": "unverified", "ok": null}')
+  assert.strictEqual(unv.ok, null, 'unverified 的 ok 必须是 null（既不是成功也不是失败）')
+})
+
+// 2026-11-11 踩到：plugin/pc/pc.py 是打包副本，停在 11-01，比真脚本旧 26KB。
+// 运行时用的是 ~/OllamaStart/pc/pc.py，所以功能没坏；但要重发插件就会带着旧代码。
+test('打包副本 plugin/pc 必须和真脚本一致（否则重发会带旧代码）', () => {
+  const pairs = ['pc.py', 'pctask.py']
+  for (const name of pairs) {
+    const real = join(PLUGIN_DIR, '..', name)
+    const copy = join(PLUGIN_DIR, 'pc', name)
+    if (!existsSync(real) || !existsSync(copy)) continue      // 别的机器上没有这种布局就跳过
+    const a = readFileSync(real)
+    const b = readFileSync(copy)
+    assert.ok(a.equals(b),
+      `${name} 的两份不一致（真脚本 ${a.length} B / 打包副本 ${b.length} B）—— 跑一次同步再发版`)
+  }
 })
 
 // ---------------------------------------------------------------------------

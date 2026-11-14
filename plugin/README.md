@@ -6,7 +6,7 @@ Windows only · 依赖一个 Python（只用标准库 + Pillow + RapidOCR）· �
 > 这是溟给 DeepSeek Harness 写的插件，也是她自己的手。  
 > 设计原则只有一条：**一步只有被观察到才算完成** —— 所以每个动作都能回读证据（截图路径、OCR 文本、坐标、退出码）。
 
-## 工具一览（19 个）
+## 工具一览（21 个）
 
 | 分类 | 工具 | 说明 |
 |---|---|---|
@@ -50,7 +50,7 @@ Windows only · 依赖一个 Python（只用标准库 + Pillow + RapidOCR）· �
 
 - 只能装进 **DSH 的 profile**：`~/.dsh/profiles/<profile>/node_modules/dsh-pc-hands/`，并在该 profile 的 `package.json` 里把 `dsh-pc-hands` 加进 `dsh.profile.bundles`。**请不要**在一个普通 npm 项目里 `npm i dsh-pc-hands` 然后 `import 'dsh-pc-hands'` —— 那样是起不来的。
 - 插件里 `import { defineTool } from '@deepseek-ai/dsh-tools'`，这个包 **由 DSH 自己提供**（不在 npm 上，profile 的 `node_modules` 里也不会出现），只在 DSH 加载插件时注入。所以 `Failed to import @deepseek-ai/dsh-tools` 只说明**没装在 DSH 里**，不是缺依赖，也没法靠 `npm i` 补上。
-- **已验证的 DSH 版本**：`@deepseek-ai/dsh 0.2.2-rc.1`（桌面端 0.2.2）。更老的版本 `defineTool` 的参数约定不同，19 个工具会被逐个拒绝。
+- **已验证的 DSH 版本**：`@deepseek-ai/dsh 0.2.2-rc.1`（桌面端 0.2.2）。更老的版本 `defineTool` 的参数约定不同，21 个工具会被逐个拒绝。
 
 ## 安装
 

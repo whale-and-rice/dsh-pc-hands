@@ -66,7 +66,7 @@ pc-doctor
 
 **找路径的规则**（不用配也能跑）：脚本目录 `config.pcDir` → `DSH_PC_DIR` → `~/OllamaStart/pc` → `~/dsh-pc-hands/pc` → `~/.dsh/pc-hands`；Python `config.pythonPath` → `DSH_PC_PYTHON` → DSH 自带运行时 → 常见安装位置 → `PATH`。都找不到时不会静默失败，而是注册一个会解释原因的 `pc_doctor`。
 
-## 19 个工具
+## 21 个工具
 
 | 分类 | 工具 | 说明 |
 |---|---|---|
@@ -74,6 +74,7 @@ pc-doctor
 | | `pc_see` | 截屏 + OCR，返回文本与截图路径 |
 | | `pc_find` | 按文字找坐标（支持 `region` / `below` / `above` / `pick`） |
 | 等 | `pc_wait` | 等某段文字出现（OCR 轮询），替代 sleep |
+| | `pc_wait_stable` | 等界面稳定（屏幕截图 + 窗口自绘两路比对），动画/闪烁不会永远判「没稳」 |
 | 动 | `pc_click` | 点文字、点坐标、点控件 |
 | | `pc_type` | 输入文本（中文走剪贴板，任何程序都吃得下） |
 | | `pc_key` | 按键 / 组合键 |
@@ -88,6 +89,7 @@ pc-doctor
 | 兜底 | `pc_console` | 读控制台窗口文字（比 OCR 准） |
 | | `pc_close` | 按标题关窗口（发 WM_CLOSE，等于点右上角） |
 | 守卫 | `pc_guard` | 弹窗守卫：只点「取消/否/关闭」，危险按钮留给人 |
+| 急停 | `pc_cancel` | 让正在跑的动作在下一步就停（滚屏/等待/点击入口都挂了；**不撤销已经发生的点击**） |
 | 自检 | `pc_doctor` | 一屏报告环境是否就绪 |
 
 动键鼠的工具会自动弹提示：「本鲸开始动键鼠了」→「做完了，可以碰屏幕了」（15 秒去抖）。
@@ -100,6 +102,12 @@ pc-doctor
 - `pc_type` 支持 `secret`：密码/令牌粘完立刻清空剪贴板
 - `pc_doctor` 在缩放不等于 100% 时直接给 WARN（那种机器上点偏最常见）
 - 文字匹配统一**不区分大小写**（`Generate new token` == `Generate New Token`）
+
+### v0.10.0 新增
+
+- **`pc_wait_stable`**：等界面**停止变化**再动手。双路判定（整屏截图 + `PrintWindow` 窗口自绘）——桌宠动画、视频这类一直在动的东西会污染纯截图判定，只判屏幕会永远「不稳」。找不到指定窗口时它返回「验不了」，**不会偷偷改判前台窗口**。
+- **`pc_cancel`**：急停。让正在跑的动作**在下一步就停**（滚动 / 等待 / 等稳定 / 点击 / 打字入口都挂了旗标）。被打断的调用退出码 **6**；注意它**不撤销已经发生的点击**。
+- 契约测试补到 7 项：新增「打包副本 `plugin/pc` 必须和真脚本一致」（否则重发会带旧代码）与「校验器自身的负向测试」。
 
 ## 出问题了怎么办
 
@@ -135,7 +143,7 @@ MIT
 
 # dsh-pc-hands (English)
 
-A DeepSeek Harness plugin that gives an agent hands and eyes on Windows: screenshot + OCR, click by text, type, scroll, clipboard, window management, popups guard, and a verified multi-step task runner — 19 tools total.
+A DeepSeek Harness plugin that gives an agent hands and eyes on Windows: screenshot + OCR, click by text, type, scroll, clipboard, window management, popups guard, and a verified multi-step task runner — 21 tools total.
 
 ```bat
 setup.cmd -WithOCR -InstallPlugin     :: install scripts, RapidOCR, and register the plugin
